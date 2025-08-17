@@ -13,6 +13,13 @@ const Settings = sequelize.define('Settings', {
     type: DataTypes.STRING,
     defaultValue: 'Hotspot Manager',
   },
+   // --- INÍCIO DA ADIÇÃO ---
+  creditMode: {
+    type: DataTypes.ENUM('reset', 'accumulate'),
+    defaultValue: 'reset',
+    comment: 'Define se o crédito diário reseta para o valor padrão ou se acumula ao saldo existente.',
+  },
+  // --- FIM DA ADIÇÃO ---
   systemLogoUrl: {
     type: DataTypes.STRING,
     allowNull: true,

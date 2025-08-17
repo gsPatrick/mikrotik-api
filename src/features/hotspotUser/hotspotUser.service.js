@@ -3,7 +3,9 @@ const { Op } = require('sequelize');
 const { HotspotUser, Company, Profile, ConnectionLog, Settings } = require('../../models');
 const { createMikrotikClient } = require('../../config/mikrotik');
 const { sendCreditExhaustedEmail } = require('../../services/email.service');
-const { createActivityLog } = require('../activity/activity.service'); // Adicionar esta importação
+const bcrypt = require('bcryptjs');
+const { writeSyncLog } = require('../../services/syncLog.service');
+const { createActivityLog } = require('../activity/activity.service');
 
 const findAllHotspotUsers = async (options) => {
   const { page = 1, limit = 10, sortBy = 'createdAt', sortOrder = 'DESC', ...filters } = options;
@@ -14,16 +16,6 @@ const findAllHotspotUsers = async (options) => {
   if (filters.status) where.status = filters.status;
   if (filters.companyId) where.companyId = filters.companyId;
   if (filters.profileId) where.profileId = filters.profileId;
-
-  if (filters.startDate && filters.endDate) {
-    where.createdAt = {
-      [Op.between]: [new Date(filters.startDate), new Date(filters.endDate)],
-    };
-  } else if (filters.startDate) {
-    where.createdAt = { [Op.gte]: new Date(filters.startDate) };
-  } else if (filters.endDate) {
-    where.createdAt = { [Op.lte]: new Date(filters.endDate) };
-  }
 
   const offset = (page - 1) * limit;
 
@@ -49,6 +41,9 @@ const createHotspotUser = async (hotspotUserData) => {
   const startTime = Date.now();
 
   try {
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(hotspotUserData.password, salt);
+
     const response = await mikrotikClient.put('/ip/hotspot/user', {
       server: 'all',
       name: hotspotUserData.username,
@@ -58,24 +53,20 @@ const createHotspotUser = async (hotspotUserData) => {
     });
 
     await ConnectionLog.create({
-      action: 'createHotspotUser_Mikrotik',
-      status: 'success',
+      action: 'createHotspotUser_Mikrotik', status: 'success',
       message: `Usuário ${hotspotUserData.username} criado com sucesso no MikroTik.`,
-      responseTime: Date.now() - startTime,
-      companyId: company.id
+      responseTime: Date.now() - startTime, companyId: company.id
     });
     
+    hotspotUserData.password = hashedPassword;
     hotspotUserData.mikrotikId = response.data['.id'];
     return await HotspotUser.create(hotspotUserData);
 
   } catch (error) {
     const errorMessage = error.response?.data?.message || error.message;
     await ConnectionLog.create({
-      action: 'createHotspotUser_Mikrotik',
-      status: 'error',
-      message: errorMessage,
-      responseTime: Date.now() - startTime,
-      companyId: company.id
+      action: 'createHotspotUser_Mikrotik', status: 'error',
+      message: errorMessage, responseTime: Date.now() - startTime, companyId: company.id
     });
     throw new Error(`Falha ao criar usuário no MikroTik: ${errorMessage}`);
   }
@@ -90,36 +81,81 @@ const findHotspotUserById = async (id) => {
   });
 };
 
+
 const updateHotspotUser = async (id, hotspotUserData) => {
-  const hotspotUser = await findHotspotUserById(id);
-  if (!hotspotUser) return null;
-  
-  const company = await Company.findByPk(hotspotUser.companyId);
-  const mikrotikClient = createMikrotikClient(company);
-  const startTime = Date.now();
+    const hotspotUser = await findHotspotUserById(id);
+    if (!hotspotUser) return null;
 
-  try {
-    const payload = {};
-    if (hotspotUserData.password) payload.password = hotspotUserData.password;
-    if (hotspotUserData.profileId) {
-        const newProfile = await Profile.findByPk(hotspotUserData.profileId);
-        if (!newProfile) throw new Error('Novo perfil não encontrado.');
-        payload.profile = newProfile.mikrotikName;
+    const company = await Company.findByPk(hotspotUser.companyId);
+    const mikrotikClient = createMikrotikClient(company);
+    const startTime = Date.now();
+
+    try {
+        // 1. Preparar o payload para enviar ao MikroTik
+        const payload = {};
+        
+        // Se uma nova senha foi enviada, adiciona ao payload do MikroTik
+        if (hotspotUserData.password && hotspotUserData.password.length > 0) {
+            payload.password = hotspotUserData.password;
+        }
+
+        // Se um novo perfil foi enviado, busca o nome do perfil no MikroTik e adiciona ao payload
+        if (hotspotUserData.profileId) {
+            const newProfile = await Profile.findByPk(hotspotUserData.profileId);
+            if (!newProfile) throw new Error('Novo perfil não encontrado.');
+            payload.profile = newProfile.mikrotikName;
+        }
+
+        // Se a turma foi alterada, atualiza o 'comment' no MikroTik
+        // A turma é uma lógica do seu sistema, mas a armazenamos no campo 'comment' do MikroTik para consistência.
+        if (hotspotUserData.turma) {
+             payload.comment = hotspotUserData.turma;
+        }
+
+        // Se o status foi alterado (ex: de 'active' para 'inactive')
+        if (hotspotUserData.status) {
+            payload.disabled = (hotspotUserData.status === 'inactive' || hotspotUserData.status === 'expired') ? 'true' : 'false';
+        }
+
+        // 2. Enviar a requisição PATCH para o MikroTik se houver algo para atualizar
+        if (Object.keys(payload).length > 0) {
+            console.log(`[Update User] Sincronizando atualizações para '${hotspotUser.username}' no MikroTik. Payload:`, payload);
+            
+            // --- A CORREÇÃO ESTÁ AQUI ---
+            // Usamos o método PATCH com o cabeçalho Content-Type explícito.
+            await mikrotikClient.patch(`/ip/hotspot/user/${hotspotUser.mikrotikId}`, 
+                payload, // O corpo da requisição com os dados a serem alterados
+                {
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+            // --- FIM DA CORREÇÃO ---
+        }
+
+        // 3. Preparar os dados para salvar no nosso banco de dados local
+        // Se uma nova senha foi enviada, precisamos gerar o hash antes de salvar.
+        if (hotspotUserData.password && hotspotUserData.password.length > 0) {
+            const salt = await bcrypt.genSalt(10);
+            hotspotUserData.password = await bcrypt.hash(hotspotUserData.password, salt);
+        } else {
+            // Garante que não salvemos uma senha vazia se ela não foi enviada
+            delete hotspotUserData.password;
+        }
+
+        // 4. Salvar as alterações no nosso banco de dados
+        const updatedUser = await hotspotUser.update(hotspotUserData);
+        
+        await ConnectionLog.create({ action: 'updateHotspotUser_Mikrotik', status: 'success', message: `Usuário ${hotspotUser.username} atualizado com sucesso.`, responseTime: Date.now() - startTime, companyId: company.id });
+
+        return updatedUser;
+
+    } catch (error) {
+        const errorMessage = error.response?.data?.message || error.message;
+        await ConnectionLog.create({ action: 'updateHotspotUser_Mikrotik', status: 'error', message: errorMessage, responseTime: Date.now() - startTime, companyId: company.id });
+        throw new Error(`Falha ao atualizar usuário no MikroTik: ${errorMessage}`);
     }
-    if (hotspotUserData.turma) payload.comment = hotspotUserData.turma;
-
-    if (Object.keys(payload).length > 0) {
-        await mikrotikClient.patch(`/ip/hotspot/user/${hotspotUser.mikrotikId}`, payload);
-    }
-    
-    await ConnectionLog.create({ action: 'updateHotspotUser_Mikrotik', status: 'success', message: `Usuário ${hotspotUser.username} atualizado.`, responseTime: Date.now() - startTime, companyId: company.id });
-
-    return await hotspotUser.update(hotspotUserData);
-  } catch (error) {
-    const errorMessage = error.response?.data?.message || error.message;
-    await ConnectionLog.create({ action: 'updateHotspotUser_Mikrotik', status: 'error', message: errorMessage, responseTime: Date.now() - startTime, companyId: company.id });
-    throw new Error(`Falha ao atualizar usuário no MikroTik: ${errorMessage}`);
-  }
 };
 
 const deleteHotspotUser = async (id) => {
@@ -132,13 +168,11 @@ const deleteHotspotUser = async (id) => {
 
   try {
     await mikrotikClient.delete(`/ip/hotspot/user/${hotspotUser.mikrotikId}`);
-    
     await ConnectionLog.create({ action: 'deleteHotspotUser_Mikrotik', status: 'success', message: `Usuário ${hotspotUser.username} deletado do MikroTik.`, responseTime: Date.now() - startTime, companyId: company.id });
-    
   } catch (error) {
     const errorMessage = error.response?.data?.message || error.message;
     if (errorMessage.includes('no such item')) {
-      await ConnectionLog.create({ action: 'deleteHotspotUser_Mikrotik', status: 'success', message: `Usuário ${hotspotUser.username} já não existia no MikroTik, removendo do banco de dados local.`, responseTime: Date.Now() - startTime, companyId: company.id }); // Corrigido Date.Now()
+      await ConnectionLog.create({ action: 'deleteHotspotUser_Mikrotik', status: 'success', message: `Usuário ${hotspotUser.username} já não existia no MikroTik.`, responseTime: Date.now() - startTime, companyId: company.id });
     } else {
       await ConnectionLog.create({ action: 'deleteHotspotUser_Mikrotik', status: 'error', message: errorMessage, responseTime: Date.now() - startTime, companyId: company.id });
       throw new Error(`Falha ao deletar usuário no MikroTik: ${errorMessage}`);
@@ -149,8 +183,9 @@ const deleteHotspotUser = async (id) => {
   return hotspotUser;
 };
 
+// --- INÍCIO DA FUNÇÃO CORRIGIDA E INTELIGENTE ---
 const resetDailyCreditsForAllUsers = async () => {
-    console.log(`--- Iniciando job: Reset Diário de Créditos ---`);
+    console.log(`--- Iniciando job: Reset Diário de Créditos Inteligente ---`);
     const settings = await Settings.findByPk(1);
     if (!settings) {
         console.error('FALHA no reset: Configurações do sistema não encontradas.');
@@ -160,154 +195,121 @@ const resetDailyCreditsForAllUsers = async () => {
     const newCreditTotalBytes = settings.defaultDailyCreditMB * 1024 * 1024;
 
     try {
+        // 1. Pega todas as empresas e cria um mapa para fácil acesso à turma ativa
+        const companies = await Company.findAll();
+        const companyTurmaMap = new Map(companies.map(c => [c.id, c.activeTurma]));
+
+        // 2. Busca todos os usuários com suas empresas associadas
+        const allUsers = await HotspotUser.findAll({ include: [{ model: Company, as: 'company' }] });
+        
+        const usersToReset = [];
+        for (const user of allUsers) {
+            const activeTurma = companyTurmaMap.get(user.companyId) || 'Nenhuma';
+            const userTurma = user.turma || 'Nenhuma';
+
+            // 3. Regra: O usuário só é elegível para o reset se pertencer à turma ativa
+            if (activeTurma === 'Nenhuma' || userTurma === activeTurma) {
+                usersToReset.push(user);
+            }
+        }
+
+        if (usersToReset.length === 0) {
+            console.log("Nenhum usuário elegível para o reset de créditos hoje.");
+            console.log(`--- Finalizado job: Reset Diário de Créditos Inteligente ---`);
+            return;
+        }
+
+        // 4. Atualiza o banco de dados para os usuários elegíveis de uma só vez
+        const userIdsToReset = usersToReset.map(u => u.id);
         const [affectedCount] = await HotspotUser.update(
             { 
                 creditsUsed: 0,
                 creditsTotal: newCreditTotalBytes,
-                status: 'active' // Reativa usuários que podem ter ficado sem crédito
+                status: 'active'
             },
-            { where: {} } // Aplica a todos os usuários de hotspot
+            { where: { id: { [Op.in]: userIdsToReset } } }
         );
 
-        console.log(`[${new Date().toISOString()}] SUCESSO no reset. ${affectedCount} usuários tiveram seus créditos resetados para ${settings.defaultDailyCreditMB} MB.`);
-    } catch (error) {
-        console.error(`[${new Date().toISOString()}] FALHA no reset de créditos. Erro: ${error.message}`);
-    }
-    console.log(`--- Finalizado job: Reset Diário de Créditos ---`);
-};
+        // 5. Agrupa usuários por empresa para reativá-los no MikroTik
+        const usersByCompany = usersToReset.reduce((acc, user) => {
+            if (user.company) {
+                if (!acc[user.companyId]) {
+                    acc[user.companyId] = { company: user.company, users: [] };
+                }
+                acc[user.companyId].users.push(user);
+            }
+            return acc;
+        }, {});
 
-// --- INÍCIO DA FUNÇÃO updateCredits (AJUSTADA) ---
-const updateCredits = async (userId, creditData, performingUser) => { // Recebe performingUser
+        for (const companyId in usersByCompany) {
+            const { company, users } = usersByCompany[companyId];
+            const mikrotikClient = createMikrotikClient(company);
+            for (const user of users) {
+                if (user.mikrotikId) {
+                    try {
+                        await mikrotikClient.post(`/ip/hotspot/user/${user.mikrotikId}/enable`);
+                    } catch (error) {
+                        console.error(`[Reset] Falha ao reativar '${user.username}' no MikroTik de '${company.name}': ${error.message}`);
+                    }
+                }
+            }
+        }
+        
+        console.log(`[${new Date().toISOString()}] SUCESSO no reset. ${affectedCount} usuários elegíveis tiveram seus créditos resetados e foram reativados.`);
+
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] FALHA GERAL no reset de créditos. Erro: ${error.message}`);
+    }
+    console.log(`--- Finalizado job: Reset Diário de Créditos Inteligente ---`);
+};
+// --- FIM DA FUNÇÃO CORRIGIDA ---
+
+
+const updateCredits = async (userId, creditData, performingUser) => {
   const hotspotUser = await findHotspotUserById(userId);
-  if (!hotspotUser) {
-    throw new Error('Usuário do hotspot não encontrado.');
-  }
+  if (!hotspotUser) throw new Error('Usuário do hotspot não encontrado.');
 
   const company = await Company.findByPk(hotspotUser.companyId);
-  if (!company) {
-    throw new Error('Empresa associada ao usuário não encontrada.');
-  }
-
   const mikrotikClient = createMikrotikClient(company);
+  const action = 'updateCredits_MikrotikCounters';
   const startTime = Date.now();
 
   const dataToUpdateInDb = {};
-  const dataToUpdateInMikrotik = {};
-
-  const oldCreditsTotal = hotspotUser.creditsTotal;
-  const oldCreditsUsed = hotspotUser.creditsUsed;
-  let activityDescriptionPart = ""; // Para a descrição do ActivityLog
-
-  // Verifica se creditsTotal foi fornecido
   if (creditData.creditsTotal !== undefined) {
     dataToUpdateInDb.creditsTotal = creditData.creditsTotal;
-    const oldTotalMB = (oldCreditsTotal / (1024 * 1024)).toFixed(2);
-    const newTotalMB = (creditData.creditsTotal / (1024 * 1024)).toFixed(2);
-
-    if (creditData.creditsTotal > oldCreditsTotal) {
-      const addedBytes = creditData.creditsTotal - oldCreditsTotal;
-      activityDescriptionPart += `adicionou ${(addedBytes / (1024 * 1024)).toFixed(2)} MB ao crédito total (novo total: ${newTotalMB} MB)`;
-    } else if (creditData.creditsTotal < oldCreditsTotal) {
-       const removedBytes = oldCreditsTotal - creditData.creditsTotal;
-       activityDescriptionPart += `removeu ${(removedBytes / (1024 * 1024)).toFixed(2)} MB do crédito total (novo total: ${newTotalMB} MB)`;
-    } else {
-      activityDescriptionPart += `ajustou o crédito total para ${newTotalMB} MB`;
-    }
-  }
-
-  // Verifica se creditsUsed foi fornecido ou se deve ser resetado implicitamente
-  // O reset ocorre se creditsUsed é explicitamente 0 ou se creditsTotal foi atualizado e creditsUsed não foi fornecido.
-  if (creditData.creditsUsed === 0 || (creditData.creditsTotal !== undefined && creditData.creditsUsed === undefined)) {
-      dataToUpdateInDb.creditsUsed = 0;
-      dataToUpdateInMikrotik['reset-counters'] = 'yes'; // Resetar no MikroTik
-      if (activityDescriptionPart) {
-          activityDescriptionPart += " e resetou o consumo utilizado";
-      } else {
-          activityDescriptionPart += "resetou o consumo utilizado";
-      }
-      // Reativa o usuário se o status atual for 'expired' e o consumo foi resetado
-      if (hotspotUser.status === 'expired') {
-        dataToUpdateInDb.status = 'active';
-        if (activityDescriptionPart) {
-          activityDescriptionPart += " e reativou o usuário";
-        } else {
-          activityDescriptionPart += "reativou o usuário";
-        }
-      }
-  } else if (creditData.creditsUsed !== undefined) { // Se creditsUsed foi fornecido e não é 0
-      dataToUpdateInDb.creditsUsed = creditData.creditsUsed;
-      const oldUsedMB = (oldCreditsUsed / (1024 * 1024)).toFixed(2);
-      const newUsedMB = (creditData.creditsUsed / (1024 * 1024)).toFixed(2);
-      if (activityDescriptionPart) {
-          activityDescriptionPart += `, e ajustou o consumo utilizado para ${newUsedMB} MB`;
-      } else {
-          activityDescriptionPart += `ajustou o consumo utilizado para ${newUsedMB} MB`;
-      }
-      // Não resetamos os contadores no MikroTik se apenas o valor de uso é ajustado para um valor diferente de zero.
-      // O reset só ocorre se for para zero para sincronizar.
+    dataToUpdateInDb.creditsUsed = 0;
   }
   
   try {
-    // 1. Atualiza no MikroTik (reseta os contadores se aplicável)
-    // Nota: O MikroTik não tem um conceito direto de "crédito total/usado" como no seu sistema.
-    // O comando 'reset-counters' apenas zera os contadores de bytes-in/out.
-    // O controle de desativação por crédito é feito pelo seu sistema no job de coleta de uso.
-    if (dataToUpdateInMikrotik['reset-counters']) {
-      await mikrotikClient.post(`/ip/hotspot/user/${hotspotUser.mikrotikId}`, {
-          ".id": hotspotUser.mikrotikId,
-          "reset-counters": "yes"
-      });
-      console.log(`Contadores de uso do usuário ${hotspotUser.username} resetados no MikroTik.`);
+    if (dataToUpdateInDb.creditsTotal !== undefined) {
+        await mikrotikClient.post(`/ip/hotspot/user/${hotspotUser.mikrotikId}/reset-counters`);
     }
 
-    // 2. Atualiza no nosso banco de dados
     const updatedUser = await hotspotUser.update(dataToUpdateInDb);
     
-    // Log da conexão com o MikroTik (se houve alguma interação com o MikroTik para esta ação)
-    if (Object.keys(dataToUpdateInMikrotik).length > 0) { // Loga apenas se houve alguma ação no MikroTik
-      await ConnectionLog.create({
-        action: 'updateCredits_MikrotikCounters', // Nome mais específico para o log de conexão
-        status: 'success',
-        message: `Contadores de uso do usuário '${hotspotUser.username}' resetados no MikroTik.`,
-        responseTime: Date.now() - startTime, // Corrigido Date.now()
-        companyId: company.id,
-      });
-    }
-
-    // 3. Log da Atividade para o Dashboard/Atividades Recentes
-    if (performingUser && activityDescriptionPart) {
-        const finalDescription = `Usuário '${performingUser.name}' ${activityDescriptionPart} para o usuário hotspot '${hotspotUser.username}' da empresa '${company.name}'.`;
-        await createActivityLog({
-            userId: performingUser.id,
-            type: 'hotspot_user_credit', // Um novo tipo mais específico
-            description: finalDescription,
-        });
-    }
+    await ConnectionLog.create({
+      action, status: 'success',
+      message: `Créditos de '${hotspotUser.username}' atualizados por '${performingUser.name}'. Novo total: ${dataToUpdateInDb.creditsTotal / (1024*1024)} MB.`,
+      responseTime: Date.now() - startTime, companyId: company.id,
+    });
+    
+    await createActivityLog({
+        userId: performingUser.id, type: 'hotspot_user_credit',
+        description: `O crédito do usuário '${hotspotUser.username}' foi alterado para ${dataToUpdateInDb.creditsTotal / (1024*1024)}MB.`
+    });
     
     return updatedUser;
     
   } catch (error) {
     const errorMessage = error.response?.data?.message || error.message;
-    await ConnectionLog.create({ 
-        action: 'updateCredits_MikrotikCounters', 
-        status: 'error', 
-        message: `Falha ao resetar contadores no MikroTik: ${errorMessage}`, 
-        responseTime: Date.now() - startTime, // Corrigido Date.now()
-        companyId: company.id 
+    await ConnectionLog.create({
+      action, status: 'error',
+      message: `Falha ao resetar contadores no MikroTik para '${hotspotUser.username}': ${errorMessage}`,
+      responseTime: Date.now() - startTime, companyId: company.id,
     });
-    // Se o erro foi no MikroTik, ainda logamos a atividade se possível no DB local
-    if (performingUser && activityDescriptionPart) {
-        const finalDescription = `Usuário '${performingUser.name}' tentou ${activityDescriptionPart} para o usuário hotspot '${hotspotUser.username}' da empresa '${company.name}', mas houve falha no MikroTik: ${errorMessage}`;
-        await createActivityLog({
-            userId: performingUser.id,
-            type: 'hotspot_user_credit_error', // Outro tipo para erros
-            description: finalDescription,
-        });
-    }
-    throw new Error(`Falha ao atualizar créditos no banco de dados e/ou MikroTik: ${errorMessage}`);
+    throw new Error(`Falha ao resetar contadores no MikroTik: ${errorMessage}`);
   }
 };
-// --- FIM DA FUNÇÃO updateCredits ---
 
 
 module.exports = {
@@ -317,5 +319,5 @@ module.exports = {
   updateHotspotUser,
   deleteHotspotUser,
   resetDailyCreditsForAllUsers,
-  updateCredits
+  updateCredits,
 };

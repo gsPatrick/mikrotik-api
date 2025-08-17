@@ -29,7 +29,6 @@ const initScheduler = async () => {
 
   // --- JOB 3: Reset diário de créditos ---
   const settings = await getSettings();
-  // Garante que settings existe, caso contrário, usa um valor padrão para evitar erro.
   const creditResetTime = settings?.creditResetTimeUTC || '03:00'; 
   const [hour, minute] = creditResetTime.split(':');
   
@@ -44,35 +43,44 @@ const initScheduler = async () => {
     timezone: "UTC"
   });
 
-  // --- NOVO JOB: Sincronização Diária de Usuários do MikroTik para o Sistema ---
-  // Exemplo: Rodar todos os dias à 01:00 AM UTC. Ajuste a frequência conforme necessário.
-  const cronExpressionImportUsers = '0 1 * * *'; // Todos os dias, à 01:00 AM UTC
-  console.log(`🔄 Job de importação de usuários agendado para rodar diariamente às 01:00 AM UTC (${cronExpressionImportUsers})`);
+  // --- NOVO JOB (TEMPORÁRIO PARA TESTE): Sincronização de Usuários e Perfis do MikroTik a CADA MINUTO ---
+  const cronExpressionImportDataForTest = '*/1 * * * *'; // A CADA MINUTO para teste
+  console.log(`🔄 Job de importação de dados (TEMPORÁRIO) agendado para rodar A CADA MINUTO (${cronExpressionImportDataForTest})`);
 
-  cron.schedule(cronExpressionImportUsers, async () => {
-    console.log(`[${new Date().toISOString()}] Executando job: Sincronização Diária de Usuários MikroTik...`);
+  cron.schedule(cronExpressionImportDataForTest, async () => {
+    console.log(`[${new Date().toISOString()}] Executando job: Sincronização de Dados MikroTik (TESTE)...`);
     const companies = await Company.findAll({ attributes: ['id', 'name'] });
 
     if (companies.length === 0) {
-      console.log('Nenhuma empresa encontrada para sincronizar usuários do MikroTik.');
+      console.log('Nenhuma empresa encontrada para sincronizar dados do MikroTik. Job de importação pulado.');
       return;
     }
 
     for (const company of companies) {
       try {
-        console.log(`Sincronizando usuários MikroTik para a empresa: '${company.name}' (ID: ${company.id})...`);
-        const { importedCount, skippedCount, totalInMikrotik } = await mikrotikService.importUsersFromMikrotik(company.id);
-        console.log(`SUCESSO: Empresa '${company.name}' - Total no MikroTik: ${totalInMikrotik}, Importados: ${importedCount}, Ignorados (já existentes): ${skippedCount}.`);
+        console.log(`[Import] Iniciando sincronização para a empresa: '${company.name}' (ID: ${company.id})...`);
+        
+        // Primeiro importa perfis
+        console.log(`[Import] Buscando perfis do MikroTik para '${company.name}'...`);
+        const { importedCount: profilesImported, updatedCount: profilesUpdated, skippedCount: profilesSkipped, totalInMikrotik: profilesTotal } = await mikrotikService.importProfilesFromMikrotik(company.id);
+        console.log(`[Import] SUCESSO (Perfis): Empresa '${company.name}' - Total no MikroTik: ${profilesTotal}, Novos: ${profilesImported}, Atualizados: ${profilesUpdated}, Ignorados: ${profilesSkipped}.`);
+
+        // Depois importa usuários
+        console.log(`[Import] Buscando usuários do MikroTik para '${company.name}'...`);
+        const { importedCount: usersImported, updatedCount: usersUpdated, skippedCount: usersSkipped, totalInMikrotik: usersTotal } = await mikrotikService.importUsersFromMikrotik(company.id);
+        console.log(`[Import] SUCESSO (Usuários): Empresa '${company.name}' - Total no MikroTik: ${usersTotal}, Novos: ${usersImported}, Atualizados: ${usersUpdated}, Ignorados: ${usersSkipped}.`);
+
+        console.log(`[Import] Sincronização completa para a empresa '${company.name}'.`);
+        
       } catch (error) {
-        console.error(`FALHA: Empresa '${company.name}' - Erro ao importar usuários: ${error.message}`);
-        // Considerar logar esta falha em ConnectionLog ou Notification se for crítico
+        console.error(`[Import] FALHA na sincronização para a empresa '${company.name}': ${error.message}`);
       }
     }
-    console.log(`[${new Date().toISOString()}] Finalizado job: Sincronização Diária de Usuários MikroTik.`);
+    console.log(`[${new Date().toISOString()}] Finalizado job: Sincronização de Dados MikroTik (TESTE).`);
   }, {
     timezone: "UTC"
   });
-  // --- FIM DO NOVO JOB ---
+  // --- FIM DO NOVO JOB (TEMPORÁRIO) ---
 
 };
 

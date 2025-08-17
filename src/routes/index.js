@@ -16,6 +16,8 @@ const systemRoutes = require('../features/system/system.routes');   // <-- Adici
 const publicRoutes = require('../features/public/public.routes'); // <-- Adicionado
 const activityRoutes = require('../features/activity/activity.routes');   // <-- Adicionar
 const notificationRoutes = require('../features/notification/notification.routes'); // <-- Adicionar
+const syncLogRoutes = require('../features/sync-logs/syncLog.routes'); // <-- NOVO
+
 // Definição das rotas
 router.use('/health', healthRoutes);
 router.use('/auth', authRoutes);
@@ -30,4 +32,6 @@ router.use('/hotspot-users', hotspotUserRoutes);
 router.use('/mikrotik', mikrotikRoutes);
 router.use('/activities', activityRoutes); // <-- Adicionar
 router.use('/notifications', notificationRoutes); // <-- Adicionar
+router.use('/sync-logs', syncLogRoutes); // <-- NOVO
+
 module.exports = router;
