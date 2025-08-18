@@ -50,6 +50,10 @@ const createHotspotUser = async (hotspotUserData) => {
       password: hotspotUserData.password,
       profile: profile.mikrotikName,
       comment: hotspotUserData.turma || '',
+    }, { // <-- ADICIONAR ESTE SEGUNDO OBJETO DE CONFIGURAÇÃO
+        headers: {
+            'Content-Type': 'application/json'
+        }
     });
 
     await ConnectionLog.create({
@@ -71,6 +75,7 @@ const createHotspotUser = async (hotspotUserData) => {
     throw new Error(`Falha ao criar usuário no MikroTik: ${errorMessage}`);
   }
 };
+
 
 const findHotspotUserById = async (id) => {
   return await HotspotUser.findByPk(id, {
@@ -247,7 +252,14 @@ const resetDailyCreditsForAllUsers = async () => {
             for (const user of users) {
                 if (user.mikrotikId) {
                     try {
-                        await mikrotikClient.post(`/ip/hotspot/user/${user.mikrotikId}/enable`);
+                        // CORREÇÃO AQUI: Usar PATCH para habilitar o usuário
+                        await mikrotikClient.patch(`/ip/hotspot/user/${user.mikrotikId}`, {
+                            disabled: 'false' // Define o status como habilitado
+                        }, {
+                            headers: {
+                                'Content-Type': 'application/json' // Garante o Content-Type correto
+                            }
+                        });
                     } catch (error) {
                         console.error(`[Reset] Falha ao reativar '${user.username}' no MikroTik de '${company.name}': ${error.message}`);
                     }
@@ -277,12 +289,19 @@ const updateCredits = async (userId, creditData, performingUser) => {
   const dataToUpdateInDb = {};
   if (creditData.creditsTotal !== undefined) {
     dataToUpdateInDb.creditsTotal = creditData.creditsTotal;
-    dataToUpdateInDb.creditsUsed = 0;
+    dataToUpdateInDb.creditsUsed = 0; // Se o total for atualizado, zera o usado
   }
   
   try {
     if (dataToUpdateInDb.creditsTotal !== undefined) {
-        await mikrotikClient.post(`/ip/hotspot/user/${hotspotUser.mikrotikId}/reset-counters`);
+        // CORREÇÃO AQUI: Enviar corpo JSON com .id e cabeçalho Content-Type
+        await mikrotikClient.post('/ip/hotspot/user/reset-counters', {
+            '.id': hotspotUser.mikrotikId // O ID do MikroTik que precisa ser resetado
+        }, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
     }
 
     const updatedUser = await hotspotUser.update(dataToUpdateInDb);
@@ -310,7 +329,6 @@ const updateCredits = async (userId, creditData, performingUser) => {
     throw new Error(`Falha ao resetar contadores no MikroTik: ${errorMessage}`);
   }
 };
-
 
 module.exports = {
   findAllHotspotUsers,

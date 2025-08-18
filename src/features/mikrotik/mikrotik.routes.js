@@ -1,46 +1,46 @@
-// src/features/company/company.routes.js
+// src/features/mikrotik/mikrotik.routes.js
 const express = require('express');
-const { body, param } = require('express-validator');
-const companyController = require('./mikrotik.controller');
+const { param } = require('express-validator');
+const mikrotikController = require('./mikrotik.controller'); // Importa o controlador REAL do MikroTik
 const { protect, authorize } = require('../../middleware/auth.middleware');
-const mikrotikController = require('./mikrotik.controller');
 
 const router = express.Router();
 
-const companyValidation = [
-  body('name').notEmpty().withMessage('O nome da empresa é obrigatório.'),
-  body('mikrotikIp').isIP().withMessage('O IP do MikroTik deve ser um IP válido.'),
-  body('mikrotikApiUser').notEmpty().withMessage('O usuário da API é obrigatório.'),
-  body('mikrotikApiPass').notEmpty().withMessage('A senha da API é obrigatória.'),
-];
+// Aplica middlewares de proteção e autorização a todas as rotas do MikroTik
+router.use(protect); // Todos os usuários logados podem ver
 
-router.post('/', protect, authorize('admin'), companyValidation, companyController.createCompany);
-router.get('/', protect, authorize('admin', 'manager'), companyController.getAllCompanies);
-router.get('/:id', protect, authorize('admin', 'manager'), companyController.getCompanyById);
-router.put('/:id', protect, authorize('admin'), companyValidation, companyController.updateCompany);
-router.delete('/:id', protect, authorize('admin'), companyController.deleteCompany);
-// Rota de teste de conexão (admin e manager podem testar)
+// Rotas específicas do MikroTik (ex: logs, importação manual)
+router.get('/logs', authorize('admin', 'manager'), mikrotikController.getMikrotikLogs); // Logs podem ser vistos por admin e manager
+
+// Rotas para importação/sincronização de dados (geralmente apenas admin)
 router.post(
-  '/:id/test-connection', protect, authorize('admin', 'manager'),
+  '/:id/import-profiles', 
+  authorize('admin'), 
   [param('id').isInt().withMessage('O ID da empresa deve ser um número inteiro.')],
-  companyController.testConnection
+  mikrotikController.importProfilesFromMikrotik
 );
-
-// --- NOVA ROTA: Alterar Turma Ativa ---
-router.patch(
-  '/:id/set-active-turma', protect, authorize('admin'),
-  [
-    param('id').isInt().withMessage('O ID da empresa deve ser um número inteiro.'),
-    body('activeTurma').isIn(['A', 'B', 'Nenhuma']).withMessage('Turma ativa inválida.')
-  ],
-  companyController.setCompanyActiveTurma
-);
-
-// --- NOVA ROTA: Sincronizar Perfis e Usuários ---
 router.post(
-  '/:id/sync-all', protect, authorize('admin'),
+  '/:id/import-users', 
+  authorize('admin'), 
   [param('id').isInt().withMessage('O ID da empresa deve ser um número inteiro.')],
-  companyController.syncAllData // <--- Novo controller
+  mikrotikController.importUsersFromMikrotik
 );
+
+// Rota para disparar coleta de uso de dados manualmente para uma empresa
+router.post(
+  '/:id/collect-usage',
+  authorize('admin'), 
+  [param('id').isInt().withMessage('O ID da empresa deve ser um número inteiro.')],
+  mikrotikController.collectUsageDataForCompany
+);
+
+// Rota para buscar vizinhos de rede
+router.get(
+  '/:id/neighbors',
+  authorize('admin'), 
+  [param('id').isInt().withMessage('O ID da empresa deve ser um número inteiro.')],
+  mikrotikController.findNetworkNeighborsForCompany
+);
+
 
 module.exports = router;

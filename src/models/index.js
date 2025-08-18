@@ -37,7 +37,8 @@ HotspotUser.belongsTo(Profile, { foreignKey: 'profileId', as: 'profile' });
 Profile.hasMany(HotspotUser, { foreignKey: 'profileId', as: 'hotspotUsers' });
 
 ConnectionLog.belongsTo(Company, { foreignKey: 'companyId', as: 'company' });
-Company.hasMany(ConnectionLog, { foreignKey: 'companyId', as: 'logs' });
+Company.hasMany(ConnectionLog, { foreignKey: 'companyId', as: 'logs', onDelete: 'CASCADE' });
+
 
 Notification.belongsTo(User, { foreignKey: 'userId', as: 'user' });
 User.hasMany(Notification, { foreignKey: 'userId', as: 'notifications' });

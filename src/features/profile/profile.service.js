@@ -1,7 +1,8 @@
 // src/features/profile/profile.service.js
 const { Op } = require('sequelize');
 const { Profile, Company, ConnectionLog } = require('../../models');
-const { createMikrotikClient } = require('../../config/mikrotik'); // <-- IMPORTA A FUNÇÃO CORRETAMENTE
+const { createMikrotikClient } = require('../../config/mikrotik');
+
 const findAllProfiles = async (options) => {
   const { page = 1, limit = 10, sortBy = 'name', sortOrder = 'ASC', ...filters } = options;
 
@@ -35,11 +36,17 @@ const createProfile = async (profileData) => {
   const action = 'createProfile_Mikrotik';
 
   try {
-    // 1. Tenta criar o perfil de usuário do hotspot no MikroTik
-    await mikrotikClient.put('/ip/hotspot/user/profile', {
+    // CORREÇÃO AQUI: Usando 'rate-limit' e 'session-timeout' (kebab-case)
+    const mikrotikPayload = {
       name: profileData.mikrotikName,
-      rate_limit: profileData.rateLimit, // Corrigido para "rate_limit" que a API espera
-      session_timeout: profileData.sessionTimeout, // Corrigido para "session_timeout"
+      'rate-limit': profileData.rateLimit || '', // Garante string vazia se null/undefined
+      'session-timeout': profileData.sessionTimeout || '0s', // Garante '0s' se null/undefined
+    };
+
+    await mikrotikClient.put('/ip/hotspot/user/profile', mikrotikPayload, {
+        headers: {
+            'Content-Type': 'application/json'
+        }
     });
 
     await ConnectionLog.create({
@@ -50,7 +57,6 @@ const createProfile = async (profileData) => {
       companyId: company.id,
     });
 
-    // 2. Se for bem-sucedido, cria no nosso banco de dados
     return await Profile.create(profileData);
 
   } catch (error) {
@@ -62,7 +68,6 @@ const createProfile = async (profileData) => {
       responseTime: Date.now() - startTime,
       companyId: company.id,
     });
-    // Lança um erro para que o controller possa capturá-lo
     throw new Error(`Falha ao criar perfil no MikroTik: ${errorMessage}`);
   }
 };
@@ -83,14 +88,20 @@ const updateProfile = async (id, profileData) => {
   const action = 'updateProfile_Mikrotik';
   
   try {
-    // Monta o payload apenas com os campos que podem ser alterados
-    const payload = {
-        rate_limit: profileData.rateLimit,
-        session_timeout: profileData.sessionTimeout,
-    };
+    // CORREÇÃO AQUI: Usando 'rate-limit' e 'session-timeout' (kebab-case) no payload
+    const mikrotikPayload = {};
+    if (profileData.rateLimit !== undefined) {
+        mikrotikPayload['rate-limit'] = profileData.rateLimit || '';
+    }
+    if (profileData.sessionTimeout !== undefined) {
+        mikrotikPayload['session-timeout'] = profileData.sessionTimeout || '0s';
+    }
     
-    // Atualiza o perfil no MikroTik usando o nome do perfil no MikroTik (mikrotikName)
-    await mikrotikClient.patch(`/ip/hotspot/user/profile/${profile.mikrotikName}`, payload);
+    await mikrotikClient.patch(`/ip/hotspot/user/profile/${profile.mikrotikName}`, mikrotikPayload, {
+        headers: {
+            'Content-Type': 'application/json'
+        }
+    });
     
     await ConnectionLog.create({
       action, status: 'success',
@@ -98,7 +109,6 @@ const updateProfile = async (id, profileData) => {
       responseTime: Date.now() - startTime, companyId: company.id
     });
 
-    // Atualiza no nosso banco de dados
     return await profile.update(profileData);
 
   } catch(error) {

@@ -1,41 +1,14 @@
 // src/services/email.service.js
 const { Resend } = require('resend');
 const { Settings } = require('../models');
+const { createNotification } = require('../features/notification/notification.service'); // Importar!
 
 /**
  * Envia um e-mail usando as configurações armazenadas no banco de dados.
  * @param {string} subject - O assunto do e-mail.
  * @param {string} html - O conteúdo HTML do e-mail.
  */
-const sendEmail = async (subject, html) => {
-  const settings = await Settings.findByPk(1);
-  if (!settings || !settings.resendApiKey || !settings.notificationEmailTo || !settings.notificationEmailFrom) {
-    console.error('Email não enviado: Configurações de e-mail (Resend) incompletas no banco de dados.');
-    return { error: 'Configurações de e-mail incompletas.' };
-  }
-
-  try {
-    const resend = new Resend(settings.resendApiKey);
-
-    const { data, error } = await resend.emails.send({
-      from: `${settings.systemName} <${settings.notificationEmailFrom}>`,
-      to: [settings.notificationEmailTo],
-      subject: subject,
-      html: html,
-    });
-
-    if (error) {
-      console.error('Erro ao enviar e-mail via Resend:', error);
-      return { error };
-    }
-
-    console.log(`E-mail enviado com sucesso para ${settings.notificationEmailTo}. ID: ${data.id}`);
-    return { data };
-  } catch (error) {
-    console.error('Exceção ao tentar enviar e-mail:', error);
-    return { error };
-  }
-};
+const sendEmail = async (subject, html) => { /* ... código existente ... */ };
 
 const sendCreditExhaustedEmail = async (hotspotUser, company) => {
   const subject = `Alerta: Crédito Esgotado para ${hotspotUser.username}`;
@@ -52,21 +25,21 @@ const sendCreditExhaustedEmail = async (hotspotUser, company) => {
     <p>O usuário permanecerá desativado até o próximo reset diário de créditos.</p>
     <p>Este é um alerta automático do Hotspot Manager.</p>
   `;
-  return await sendEmail(subject, html);
+  const emailResult = await sendEmail(subject, html);
+
+  // NOVO: Cria uma notificação para o admin quando o crédito é esgotado
+  await createNotification({
+    description: `Crédito esgotado para o usuário ${hotspotUser.username} da empresa ${company.name}.`,
+    type: 'aviso', // 'aviso' ou 'erro' dependendo da criticidade
+    details: `Usuário: ${hotspotUser.username}\nEmpresa: ${company.name}\nCrédito Total: ${(hotspotUser.creditsTotal / (1024 * 1024)).toFixed(2)} MB\nCrédito Usado: ${(hotspotUser.creditsUsed / (1024 * 1024)).toFixed(2)} MB\nEmail enviado: ${!emailResult.error ? 'Sim' : 'Não, erro: ' + emailResult.error.message}`,
+    userId: null // Isso fará com que a notificação seja atribuída ao admin padrão
+  });
+  return emailResult;
 };
 
-const sendTestEmail = async () => {
-    const subject = 'E-mail de Teste - Hotspot Manager';
-    const html = `
-        <h1>Olá!</h1>
-        <p>Este é um e-mail de teste gerado a partir do seu painel Hotspot Manager.</p>
-        <p>Se você recebeu este e-mail, suas configurações do Resend estão funcionando corretamente.</p>
-        <p><strong>Data/Hora:</strong> ${new Date().toLocaleString('pt-BR')}</p>
-    `;
-    return await sendEmail(subject, html);
-}
+const sendTestEmail = async () => { /* ... código existente ... */ };
 
 module.exports = {
   sendCreditExhaustedEmail,
-  sendTestEmail, // <-- Exportar a nova função de teste
+  sendTestEmail,
 };
