@@ -1,6 +1,7 @@
 // src/features/settings/settings.controller.js
 const settingsService = require('./settings.service');
 const { sendTestEmail } = require('../../services/email.service');
+const scheduler = require('../../scheduler'); // <-- A CORREÇÃO É ESTA LINHA
 
 const getCurrentSettings = async (req, res) => {
   try {
@@ -13,12 +14,21 @@ const getCurrentSettings = async (req, res) => {
 
 const updateCurrentSettings = async (req, res) => {
   try {
-    const updatedSettings = await settingsService.updateSettings(req.body);
-    res.status(200).json({ success: true, message: 'Configurações atualizadas com sucesso!', data: updatedSettings });
+    const newSettingsData = req.body;
+    const updatedSettings = await settingsService.updateSettings(newSettingsData);
+
+    // --- A CORREÇÃO ESTÁ AQUI ---
+    // Simplesmente chamamos a função que reagenda tudo, sem precisar de lógica aqui.
+    // O nome da função foi corrigido de 'rescheduleTask' para 'rescheduleAllTasks'.
+    await scheduler.rescheduleAllTasks();
+    // --- FIM DA CORREÇÃO ---
+
+    res.status(200).json({ success: true, message: 'Configurações atualizadas e tarefas reagendadas com sucesso!', data: updatedSettings });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Erro ao atualizar configurações.', error: error.message });
   }
 };
+
 
 // <-- Início do Novo Controller -->
 const testEmailSettings = async (req, res) => {

@@ -46,4 +46,18 @@ router.post(
     companyController.syncAllData
 );
 
+
+
+// --- INÍCIO DA NOVA ROTA ---
+router.post(
+  '/:id/bulk-add-credits',
+  protect,
+  authorize('admin'), // Apenas admins podem fazer isso
+  [
+    param('id').isInt().withMessage('O ID da empresa deve ser um número inteiro.'),
+    body('creditAmountMB').isNumeric().withMessage('A quantidade de crédito (MB) deve ser um número.')
+  ],
+  companyController.bulkAddCreditsToCompanyUsers
+);
+
 module.exports = router;

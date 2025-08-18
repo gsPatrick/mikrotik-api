@@ -346,6 +346,88 @@ const syncAllDataForCompany = async (companyId) => {
     }
 };
 
+// --- INÍCIO DA NOVA FUNÇÃO ---
+const bulkAddCredits = async (companyId, creditAmountMB, performingUserId) => {
+  const company = await findCompanyById(companyId);
+  if (!company) throw new Error('Empresa não encontrada.');
+
+  const creditAmountBytes = creditAmountMB * 1024 * 1024;
+  if (creditAmountBytes <= 0) throw new Error('A quantidade de crédito deve ser positiva.');
+
+  const mikrotikClient = createMikrotikClient(company);
+  const users = await HotspotUser.findAll({ where: { companyId } });
+
+  if (users.length === 0) {
+    return {
+      success: true,
+      message: 'Nenhum usuário encontrado para esta empresa. Nenhuma ação foi tomada.',
+      stats: { updatedCount: 0, reactivatedCount: 0, errorCount: 0 }
+    };
+  }
+  
+  console.log(`[BULK CREDIT] Iniciando adição de ${creditAmountMB}MB para ${users.length} usuários da empresa '${company.name}'.`);
+
+  let updatedCount = 0;
+  let reactivatedCount = 0;
+  let errorCount = 0;
+  const errors = [];
+
+  for (const user of users) {
+    try {
+      const dataToUpdate = {
+        creditsTotal: creditAmountBytes,
+        creditsUsed: 0
+      };
+
+      // Se o usuário estava expirado, reativa ele no MikroTik e no sistema local
+      if (user.status === 'expired') {
+        dataToUpdate.status = 'active';
+
+        if (user.mikrotikId) {
+          console.log(`[BULK CREDIT] Reativando usuário expirado '${user.username}' no MikroTik...`);
+          const enablePayload = { '.id': user.mikrotikId, disabled: 'false' };
+          await mikrotikClient.post('/ip/hotspot/user/set', enablePayload, { headers: { 'Content-Type': 'application/json' } });
+          reactivatedCount++;
+        }
+      }
+      
+      // Reseta os contadores no MikroTik para garantir consistência
+      if (user.mikrotikId) {
+         const resetPayload = { '.id': user.mikrotikId };
+         await mikrotikClient.post('/ip/hotspot/user/reset-counters', resetPayload, { headers: { 'Content-Type': 'application/json' } });
+      }
+
+      await user.update(dataToUpdate);
+      updatedCount++;
+
+    } catch (error) {
+      const errorMessage = `Falha ao processar usuário '${user.username}': ${error.message}`;
+      console.error(`[BULK CREDIT] ERRO: ${errorMessage}`);
+      errors.push(errorMessage);
+      errorCount++;
+    }
+  }
+
+  // Loga a atividade em massa
+  await createActivityLog({
+    userId: performingUserId,
+    type: 'company_bulk_credit',
+    description: `Adicionou ${creditAmountMB}MB de crédito para ${updatedCount} usuários da empresa '${company.name}'.`
+  });
+
+  return {
+    success: true,
+    message: `Operação concluída para a empresa '${company.name}'.`,
+    stats: {
+      totalUsers: users.length,
+      updatedCount,
+      reactivatedCount,
+      errorCount,
+      errors
+    }
+  };
+};
+
 module.exports = {
   findAllCompanies,
   findCompanyById,
@@ -356,4 +438,5 @@ module.exports = {
   setCompanyActiveTurma,
   syncHotspotUserStatusByTurma,
   syncAllDataForCompany,
+  bulkAddCredits
 };

@@ -57,7 +57,7 @@ const startServer = async () => {
     await db.sequelize.authenticate();
     console.log('✅ Conexão com o banco de dados estabelecida com sucesso.');
 
-    await db.sequelize.sync({ force: true });
+    await db.sequelize.sync({ force: false });
     console.log('🔄 Models sincronizados com o banco de dados.');
 
     // <-- CHAMA A FUNÇÃO DE SEEDING AQUI -->

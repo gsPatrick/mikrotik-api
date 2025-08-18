@@ -84,8 +84,26 @@ const collectUsageData = async (companyId) => {
 
       const activeSessionData = activeSessionsMap.get(mikrotikUser.name);
       if (activeSessionData) {
-        totalBytesUsed += activeSessionData.bytesIn + activeSessionData.bytesOut;
+        // ATENÇÃO: A API do MikroTik `/ip/hotspot/user` já inclui os bytes da sessão ativa.
+        // Somar novamente os bytes da sessão ativa duplicaria a contagem.
+        // O valor de `totalBytesUsed` já é o correto e final.
       }
+
+      // --- INÍCIO DA LÓGICA DE PERÍODO DE CARÊNCIA ---
+      if (dbUser.lastResetDate) {
+        const now = new Date();
+        const minutesSinceReset = (now.getTime() - dbUser.lastResetDate.getTime()) / (1000 * 60);
+        
+        // Se o reset ocorreu nos últimos 5 minutos, pule a verificação de desativação.
+        if (minutesSinceReset < 5) {
+          console.log(`[GRACE PERIOD] Usuário '${dbUser.username}' foi resetado recentemente. Verificação de excesso de crédito ignorada desta vez.`);
+          // Apenas atualiza os bytes usados e continua para o próximo usuário
+          await HotspotUser.update({ creditsUsed: totalBytesUsed }, { where: { id: dbUser.id } });
+          updatedCount++;
+          continue; // PULA PARA O PRÓXIMO USUÁRIO
+        }
+      }
+      // --- FIM DA LÓGICA DE PERÍODO DE CARÊNCIA ---
 
       const hadCredit = dbUser.creditsTotal > 0 && dbUser.creditsUsed < dbUser.creditsTotal;
       const creditExceeded = totalBytesUsed >= dbUser.creditsTotal && dbUser.creditsTotal > 0;
@@ -94,8 +112,9 @@ const collectUsageData = async (companyId) => {
         console.log(`Crédito excedido para ${dbUser.username}. Desativando e desconectando no MikroTik...`);
         try {
           // 1. DESATIVAR o usuário no MikroTik
-          await mikrotikClient.patch(`/ip/hotspot/user/${dbUser.mikrotikId}`, 
+          await mikrotikClient.post('/ip/hotspot/user/set', 
             {
+              '.id': dbUser.mikrotikId,
               disabled: 'true'
             },
             {
@@ -104,32 +123,15 @@ const collectUsageData = async (companyId) => {
               }
             }
           );
-
           console.log(`✅ Usuário ${dbUser.username} desativado no MikroTik`);
 
           // 2. DERRUBAR a sessão ativa se existir
           if (activeSessionData && activeSessionData.sessionId) {
             try {
-              // Método 1: Derrubar por ID da sessão (mais confiável)
-              await mikrotikClient.delete(`/ip/hotspot/active/${activeSessionData.sessionId}`);
+              await mikrotikClient.post('/ip/hotspot/active/remove', { '.id': activeSessionData.sessionId }, { headers: { 'Content-Type': 'application/json' } });
               console.log(`✅ Sessão ativa do usuário ${dbUser.username} derrubada (ID: ${activeSessionData.sessionId})`);
-              
             } catch (sessionError) {
-              // Se falhar por ID, tentar por nome do usuário
-              try {
-                await mikrotikClient.post('/ip/hotspot/active/remove', 
-                  { user: dbUser.username },
-                  { 
-                    headers: { 
-                      'Content-Type': 'application/json' 
-                    } 
-                  }
-                );
-                console.log(`✅ Sessão do usuário ${dbUser.username} derrubada por nome`);
-              } catch (secondSessionError) {
-                console.warn(`⚠️ Falha ao derrubar sessão de ${dbUser.username}:`, secondSessionError.message);
-                // Não é crítico se não conseguir derrubar a sessão
-              }
+                console.warn(`⚠️ Falha ao derrubar sessão de ${dbUser.username}:`, sessionError.message);
             }
           } else {
             console.log(`ℹ️ Usuário ${dbUser.username} não possui sessão ativa para derrubar`);
@@ -139,7 +141,7 @@ const collectUsageData = async (companyId) => {
           await ConnectionLog.create({ 
             action: 'disableUserAndDisconnect', 
             status: 'success', 
-            message: `Usuário ${dbUser.username} desativado e desconectado por excesso de crédito. Sessão: ${activeSessionData ? activeSessionData.sessionId : 'N/A'}`, 
+            message: `Usuário ${dbUser.username} desativado e desconectado por excesso de crédito.`, 
             companyId 
           });
           

@@ -95,6 +95,31 @@ const syncAllData = async (req, res) => {
     }
 };
 
+// --- INÍCIO DO NOVO CONTROLADOR ---
+const bulkAddCreditsToCompanyUsers = async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ success: false, errors: errors.array() });
+  }
+
+  try {
+    const { id } = req.params;
+    const { creditAmountMB } = req.body;
+    const performingUserId = req.user.id;
+
+    if (!creditAmountMB || typeof creditAmountMB !== 'number' || creditAmountMB <= 0) {
+      return res.status(400).json({ success: false, message: 'O campo "creditAmountMB" é obrigatório e deve ser um número positivo.' });
+    }
+
+    const result = await companyService.bulkAddCredits(id, creditAmountMB, performingUserId);
+
+    res.status(200).json(result);
+
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Erro ao adicionar crédito em massa para os usuários.', error: error.message });
+  }
+};
+
 module.exports = {
-  getAllCompanies, createCompany, getCompanyById, updateCompany, deleteCompany, testConnection, setCompanyActiveTurma, syncAllData,
+  getAllCompanies, bulkAddCreditsToCompanyUsers, createCompany, getCompanyById, updateCompany, deleteCompany, testConnection, setCompanyActiveTurma, syncAllData,
 };
