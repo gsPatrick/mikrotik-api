@@ -1,12 +1,12 @@
 // src/features/company/company.service.js
 const { Op, fn, col } = require('sequelize');
-const { Company, HotspotUser, ConnectionLog, User } = require('../../models'); // Adicionado User
-const db = require('../../models'); // Usado para acessar outros modelos como HotspotUser
+const { Company, HotspotUser, ConnectionLog, User } = require('../../models');
+const db = require('../../models');
 const { createMikrotikClient } = require('../../config/mikrotik');
-const { writeSyncLog } = require('../../services/syncLog.service'); // Geralmente usado para logs de sincronização MikroTik
-const { createActivityLog } = require('../activity/activity.service'); // <-- Log de atividades do usuário no painel
-const mikrotikService = require('../mikrotik/mikrotik.service'); // <-- Serviço MikroTik para orquestração
-const { createNotification } = require('../notification/notification.service'); // <-- IMPORTANTE: Notificações
+const { writeSyncLog } = require('../../services/syncLog.service');
+const { createActivityLog } = require('../activity/activity.service');
+const mikrotikService = require('../mikrotik/mikrotik.service');
+const { createNotification } = require('../notification/notification.service');
 
 const findAllCompanies = async (options) => {
   const { page = 1, limit = 10, sortBy = 'createdAt', sortOrder = 'DESC', ...filters } = options;
@@ -20,23 +20,21 @@ const findAllCompanies = async (options) => {
     limit,
     offset,
     order: [[sortBy, sortOrder]],
-    // >>> CORREÇÃO AQUI: Incluir contagem de usuários ativos <<<
     include: [{
       model: HotspotUser,
-      as: 'hotspotUsers', // O 'as' deve corresponder ao alias definido na relação em src/models/index.js
-      attributes: [], // Não queremos os atributos dos usuários em si, apenas a contagem
-      where: { status: 'active' }, // Apenas usuários ativos
-      duplicating: false, // Importante para COUNT com includes
-      required: false // LEFT JOIN para incluir empresas mesmo sem usuários ativos
+      as: 'hotspotUsers',
+      attributes: [],
+      where: { status: 'active' },
+      duplicating: false,
+      required: false
     }],
     attributes: {
       include: [
-        // Adiciona um atributo virtual 'activeUsersCount'
         [fn('COUNT', col('hotspotUsers.id')), 'activeUsersCount']
       ]
     },
-    group: ['Company.id'], // Agrupa por Company.id para a contagem
-    subQuery: false // Necessário quando se usa group com pagination
+    group: ['Company.id'],
+    subQuery: false
   });
 };
 
@@ -52,24 +50,22 @@ const createCompany = async (companyData, userId) => {
     description: `Empresa '${company.name}' foi criada.`,
   });
   try {
-    await module.exports.testCompanyConnection(company.id); // Tenta conectar e atualiza o status
+    await module.exports.testCompanyConnection(company.id);
     await company.update({ status: 'online' });
-    // Notificação de sucesso na criação e conexão
     await createNotification({
         description: `Empresa '${company.name}' criada e conectada com sucesso.`,
         type: 'sucesso',
         details: `IP do MikroTik: ${company.mikrotikIp}`,
-        userId: null // Notificação para o admin
+        userId: null
     });
   } catch (error) {
     await company.update({ status: 'offline' });
     console.warn(`[Status Sync] Falha ao conectar com a nova empresa '${company.name}'. Status: offline. Erro: ${error.message}`);
-    // Notificação de falha na conexão da empresa recém-criada
     await createNotification({
         description: `Empresa '${company.name}' criada, mas falha ao conectar com o MikroTik.`,
         type: 'erro',
         details: `IP do MikroTik: ${company.mikrotikIp}. Erro: ${error.message}`,
-        userId: null // Notificação para o admin
+        userId: null
     });
   }
   return company;
@@ -79,7 +75,6 @@ const updateCompany = async (id, companyData, userId) => {
   const company = await module.exports.findCompanyById(id);
   if (!company) return null;
 
-  // Guarda os dados antigos para verificação de mudança
   const oldMikrotikIp = company.mikrotikIp;
   const oldMikrotikApiUser = company.mikrotikApiUser;
   const oldMikrotikApiPass = company.mikrotikApiPass;
@@ -93,11 +88,10 @@ const updateCompany = async (id, companyData, userId) => {
     description: `Empresa '${updatedCompany.name}' foi atualizada.`,
   });
 
-  // Se os dados de conexão foram alterados, testar novamente e notificar
   if (
     oldMikrotikIp !== updatedCompany.mikrotikIp ||
     oldMikrotikApiUser !== updatedCompany.mikrotikApiUser ||
-    (companyData.mikrotikApiPass && companyData.mikrotikApiPass.length > 0) || // Se a senha foi alterada
+    (companyData.mikrotikApiPass && companyData.mikrotikApiPass.length > 0) ||
     oldMikrotikApiPort !== updatedCompany.mikrotikApiPort
   ) {
     try {
@@ -107,7 +101,7 @@ const updateCompany = async (id, companyData, userId) => {
             description: `Configurações de conexão da empresa '${updatedCompany.name}' atualizadas e testadas com sucesso.`,
             type: 'sucesso',
             details: `Novo IP: ${updatedCompany.mikrotikIp}`,
-            userId: null // Para o admin
+            userId: null
         });
     } catch (error) {
         await updatedCompany.update({ status: 'offline' });
@@ -115,7 +109,7 @@ const updateCompany = async (id, companyData, userId) => {
             description: `Configurações de conexão da empresa '${updatedCompany.name}' atualizadas, mas falha ao reconectar.`,
             type: 'erro',
             details: `IP: ${updatedCompany.mikrotikIp}. Erro: ${error.message}`,
-            userId: null // Para o admin
+            userId: null
         });
     }
   }
@@ -126,14 +120,14 @@ const updateCompany = async (id, companyData, userId) => {
 const deleteCompany = async (id, userId) => {
   const company = await module.exports.findCompanyById(id);
   if (!company) return null;
-  const companyName = company.name; // Salva o nome antes de deletar
+  const companyName = company.name;
   await company.destroy();
   await createActivityLog({
     userId: userId,
     type: 'company',
     description: `Empresa '${companyName}' foi deletada.`,
   });
-  await createNotification({ // Notificação de deleção de empresa
+  await createNotification({
       description: `Empresa '${companyName}' foi deletada do sistema.`,
       type: 'aviso',
       details: `Ação realizada por: ${(await User.findByPk(userId))?.name || 'Sistema'}.`,
@@ -150,28 +144,37 @@ const testCompanyConnection = async (id) => {
   const action = 'testConnection';
   try {
     await mikrotikClient.get('/system/identity');
-    await ConnectionLog.create({ action, status: 'success', message: 'Teste de conexão bem-sucedido.', responseTime: Date.now() - startTime, companyId: id, });
-    // Notificação de sucesso na conexão (geralmente não necessária aqui para evitar spam,
-    // a menos que seja um teste manual explícito)
-    /* await createNotification({
-        description: `Conexão com a empresa '${company.name}' testada com sucesso.`,
-        type: 'sucesso',
-        details: `IP: ${company.mikrotikIp}`,
-        userId: null
-    }); */
+    await ConnectionLog.create({ 
+      action, 
+      status: 'success', 
+      message: 'Teste de conexão bem-sucedido.', 
+      responseTime: Date.now() - startTime, 
+      companyId: id, 
+    });
     return { success: true, message: 'Conexão com o MikroTik bem-sucedida!' };
   } catch (error) {
     let friendlyMessage = 'Erro desconhecido.';
-    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') { friendlyMessage = 'Não foi possível resolver o IP ou a porta está sendo recusada. Verifique o IP/Porta e o firewall do MikroTik.'; }
-    else if (error.response?.status === 401) { friendlyMessage = 'Credenciais inválidas. Verifique o usuário e senha da API.'; }
-    else { friendlyMessage = error.response?.data?.message || error.message; }
-    await ConnectionLog.create({ action, status: 'error', message: friendlyMessage, responseTime: Date.now() - startTime, companyId: id, });
-    // Notificação de falha de conexão
+    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') { 
+      friendlyMessage = 'Não foi possível resolver o IP ou a porta está sendo recusada. Verifique o IP/Porta e o firewall do MikroTik.'; 
+    }
+    else if (error.response?.status === 401) { 
+      friendlyMessage = 'Credenciais inválidas. Verifique o usuário e senha da API.'; 
+    }
+    else { 
+      friendlyMessage = error.response?.data?.message || error.message; 
+    }
+    await ConnectionLog.create({ 
+      action, 
+      status: 'error', 
+      message: friendlyMessage, 
+      responseTime: Date.now() - startTime, 
+      companyId: id, 
+    });
     await createNotification({
         description: `Falha na conexão com o MikroTik da empresa '${company.name}' (IP: ${company.mikrotikIp}).`,
         type: 'erro',
         details: `Detalhes: ${friendlyMessage}`,
-        userId: null // Notificação para o admin
+        userId: null
     });
     throw new Error(friendlyMessage);
   }
@@ -181,7 +184,7 @@ const setCompanyActiveTurma = async (companyId, newActiveTurma, userId) => {
   const company = await module.exports.findCompanyById(companyId);
   if (!company) throw new Error('Empresa não encontrada.');
   const oldActiveTurma = company.activeTurma;
-  if (oldActiveTurma === newActiveTurma) return company; // Nenhuma mudança
+  if (oldActiveTurma === newActiveTurma) return company;
   
   await company.update({ activeTurma: newActiveTurma });
 
@@ -190,11 +193,11 @@ const setCompanyActiveTurma = async (companyId, newActiveTurma, userId) => {
     type: 'company',
     description: `Turma ativa da empresa '${company.name}' alterada de '${oldActiveTurma}' para '${newActiveTurma}'.`,
   });
-  // Notificação informativa da alteração da turma
+  
   await createNotification({
       description: `Turma ativa da empresa '${company.name}' alterada para '${newActiveTurma}'.`,
       type: 'info',
-      details: `Ação realizada por: ${(await User.findByPk(userId))?.name || 'Sistema'}.`, // Busca o nome do usuário que fez a alteração
+      details: `Ação realizada por: ${(await User.findByPk(userId))?.name || 'Sistema'}.`,
       userId: null
   });
 
@@ -202,40 +205,90 @@ const setCompanyActiveTurma = async (companyId, newActiveTurma, userId) => {
   return company;
 };
 
+// CORREÇÃO PRINCIPAL: Função para sincronizar status dos usuários por turma
 const syncHotspotUserStatusByTurma = async (companyId, activeTurma) => {
     const company = await module.exports.findCompanyById(companyId);
     if (!company) throw new Error('Empresa não encontrada.');
+    
     const mikrotikClient = createMikrotikClient(company);
     const hotspotUsersInSystem = await db.HotspotUser.findAll({ where: { companyId } });
 
     let activatedCount = 0;
     let deactivatedCount = 0;
+    let skippedCount = 0;
+    const startTime = Date.now();
+
+    console.log(`[Sync Turma] Iniciando sincronização para empresa '${company.name}'. Turma ativa: '${activeTurma}'. Total de usuários: ${hotspotUsersInSystem.length}`);
 
     for (const user of hotspotUsersInSystem) {
-        if (!user.mikrotikId) continue;
+        if (!user.mikrotikId) {
+            console.warn(`[Sync Turma] Usuário '${user.username}' não possui mikrotikId. Pulando...`);
+            skippedCount++;
+            continue;
+        }
+        
         const userTurma = user.turma || 'Nenhuma';
         const shouldBeActive = activeTurma === 'Nenhuma' || userTurma === activeTurma;
+
+        console.log(`[Sync Turma] Usuário: ${user.username}, Turma: ${userTurma}, Deveria estar ativo: ${shouldBeActive}, Status atual: ${user.status}`);
 
         try {
             if (shouldBeActive) {
                 // Ativa se for para estar ativo E o status atual não for 'active'
                 if (user.status !== 'active') {
-                    await mikrotikClient.patch(`/ip/hotspot/user/${user.mikrotikId}`, { disabled: 'false' }, { headers: { 'Content-Type': 'application/json' } });
+                    console.log(`[Sync Turma] Ativando usuário '${user.username}' no MikroTik...`);
+                    
+                    // CORREÇÃO: Usar POST com /set
+                    await mikrotikClient.post('/ip/hotspot/user/set', {
+                        '.id': user.mikrotikId,
+                        disabled: 'false'
+                    }, {
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
                     await user.update({ status: 'active' });
                     activatedCount++;
+                    console.log(`[Sync Turma] ✅ Usuário '${user.username}' ativado com sucesso.`);
+                } else {
+                    console.log(`[Sync Turma] Usuário '${user.username}' já está ativo. Nenhuma ação necessária.`);
                 }
             } else {
-                // Desativa se não for para estar ativo E o status atual for 'active'
-                if (user.status === 'active') {
-                    await mikrotikClient.patch(`/ip/hotspot/user/${user.mikrotikId}`, { disabled: 'true' }, { headers: { 'Content-Type': 'application/json' } });
+                // Desativa se não for para estar ativo E o status atual não for 'inactive'
+                if (user.status !== 'inactive') {
+                    console.log(`[Sync Turma] Desativando usuário '${user.username}' no MikroTik...`);
+                    
+                    // CORREÇÃO: Usar POST com /set
+                    await mikrotikClient.post('/ip/hotspot/user/set', {
+                        '.id': user.mikrotikId,
+                        disabled: 'true'
+                    }, {
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
                     await user.update({ status: 'inactive' });
                     deactivatedCount++;
+                    console.log(`[Sync Turma] ❌ Usuário '${user.username}' desativado com sucesso.`);
+                } else {
+                    console.log(`[Sync Turma] Usuário '${user.username}' já está inativo. Nenhuma ação necessária.`);
                 }
             }
         } catch (error) {
             const errorMessage = error.response?.data?.message || error.message;
-            console.error(`[Sync Turma] Falha ao ajustar status de '${user.username}' na empresa '${company.name}': ${errorMessage}`);
-            // Notificação de erro no ajuste de status por turma
+            console.error(`[Sync Turma] ⚠️  Falha ao ajustar status de '${user.username}' na empresa '${company.name}': ${errorMessage}`);
+            
+            // Log de erro no ConnectionLog
+            await ConnectionLog.create({
+                action: 'syncHotspotUserStatusByTurma',
+                status: 'error',
+                message: `Falha ao ajustar status do usuário '${user.username}': ${errorMessage}`,
+                responseTime: Date.now() - startTime,
+                companyId: company.id
+            });
+            
             await createNotification({
                 description: `Falha ao ajustar status do usuário '${user.username}' na empresa '${company.name}' pela turma.`,
                 type: 'erro',
@@ -244,18 +297,29 @@ const syncHotspotUserStatusByTurma = async (companyId, activeTurma) => {
             });
         }
     }
-    // Notificação de resumo da sincronização de status por turma (opcional)
+
+    // Log de sucesso
+    await ConnectionLog.create({
+        action: 'syncHotspotUserStatusByTurma',
+        status: 'success',
+        message: `Sincronização por turma concluída. Ativados: ${activatedCount}, Desativados: ${deactivatedCount}, Pulados: ${skippedCount}`,
+        responseTime: Date.now() - startTime,
+        companyId: company.id
+    });
+
+    console.log(`[Sync Turma] ✅ Sincronização concluída para empresa '${company.name}'. Ativados: ${activatedCount}, Desativados: ${deactivatedCount}, Pulados: ${skippedCount}`);
+
     await createNotification({
         description: `Sincronização de status de usuários por turma concluída para a empresa '${company.name}'.`,
         type: 'info',
-        details: `Ativados: ${activatedCount}. Desativados: ${deactivatedCount}. Turma Ativa: ${activeTurma}.`,
+        details: `Ativados: ${activatedCount}. Desativados: ${deactivatedCount}. Turma Ativa: ${activeTurma}. Usuários sem ID: ${skippedCount}.`,
         userId: null
     });
 };
 
 const syncAllDataForCompany = async (companyId) => {
     console.log(`[Sync Service] Orquestrando sincronização para a empresa ID: ${companyId}`);
-    const company = await Company.findByPk(companyId); // Busca a empresa para o log
+    const company = await Company.findByPk(companyId);
     if (!company) throw new Error('Empresa não encontrada.');
 
     try {
@@ -281,7 +345,6 @@ const syncAllDataForCompany = async (companyId) => {
         throw error;
     }
 };
-
 
 module.exports = {
   findAllCompanies,
