@@ -1,4 +1,4 @@
-// src/features/mikrotik/mikrotik.service.js
+// src/features/mikrotik/mikrotik.service.js - VERSÃO UNIFICADA
 const { Op } = require('sequelize');
 const { Company, HotspotUser, Profile, ConnectionLog, Settings } = require('../../models');
 const { createMikrotikClient } = require('../../config/mikrotik');
@@ -6,7 +6,411 @@ const { sendCreditExhaustedEmail } = require('../../services/email.service');
 const bcrypt = require('bcryptjs');
 const { writeSyncLog } = require('../../services/syncLog.service');
 
-// Converte strings de tempo do MikroTik (ex: "1h30m", "0d 01:00:00") para minutos ou 'null' para ilimitado
+// ✅ FUNÇÃO PRINCIPAL UNIFICADA: Coleta de uso em tempo real
+const collectUsageDataUnified = async (companyId) => {
+  console.log(`[COLLECT-UNIFIED] Iniciando coleta para empresa ID: ${companyId}`);
+  
+  const company = await Company.findByPk(companyId);
+  if (!company) return { error: 'Empresa não encontrada.' };
+
+  const mikrotikClient = createMikrotikClient(company);
+  const startTime = Date.now();
+  const action = 'collectUsageDataUnified';
+
+  try {
+    // 1. BUSCAR DADOS DO MIKROTIK
+    console.log(`[COLLECT-UNIFIED] Buscando dados do MikroTik...`);
+    
+    const [activeSessionsResponse, allUsersResponse] = await Promise.all([
+      mikrotikClient.get('/ip/hotspot/active'),
+      mikrotikClient.get('/ip/hotspot/user')
+    ]);
+    
+    const activeSessions = Array.isArray(activeSessionsResponse.data) ? activeSessionsResponse.data : [];
+    const allMikrotikUsers = Array.isArray(allUsersResponse.data) ? allUsersResponse.data : [];
+    
+    console.log(`[COLLECT-UNIFIED] ${activeSessions.length} sessões ativas, ${allMikrotikUsers.length} usuários cadastrados`);
+
+    // 2. MAPEAR SESSÕES ATIVAS
+    const activeSessionsMap = new Map();
+    activeSessions.forEach(session => {
+      if (session.user || session.name) {
+        const username = session.user || session.name;
+        const bytesIn = parseInt(session['bytes-in'] || session.bytesIn || 0);
+        const bytesOut = parseInt(session['bytes-out'] || session.bytesOut || 0);
+        
+        activeSessionsMap.set(username, {
+          sessionId: session['.id'] || session.id,
+          bytesIn,
+          bytesOut,
+          totalSessionBytes: bytesIn + bytesOut,
+          address: session.address,
+          macAddress: session['mac-address'] || session.mac,
+          uptime: session.uptime
+        });
+      }
+    });
+
+    // 3. PROCESSAR USUÁRIOS DO BANCO
+    const dbUsers = await HotspotUser.findAll({
+      where: { companyId },
+      include: [{ model: Company, as: 'company' }]
+    });
+
+    let updatedCount = 0;
+    let expiredCount = 0;
+    let errors = 0;
+
+    console.log(`[COLLECT-UNIFIED] Processando ${dbUsers.length} usuários do banco...`);
+
+    for (const dbUser of dbUsers) {
+      try {
+        const activeSession = activeSessionsMap.get(dbUser.username);
+        const previousSessionBytes = dbUser.currentSessionBytes || 0;
+        
+        if (activeSession) {
+          // ✅ USUÁRIO ESTÁ ATIVO - CALCULAR INCREMENTO
+          const currentSessionBytes = activeSession.totalSessionBytes;
+          const incremento = currentSessionBytes - previousSessionBytes;
+          
+          // Só processar se houve incremento de consumo
+          if (incremento > 0) {
+            const newCreditsUsed = dbUser.creditsUsed + incremento;
+            
+            // VERIFICAR PERÍODO DE CARÊNCIA
+            const isInGracePeriod = dbUser.lastResetDate && 
+              ((new Date() - dbUser.lastResetDate) / (1000 * 60)) < 5;
+            
+            if (isInGracePeriod) {
+              console.log(`[GRACE] '${dbUser.username}' em período de carência (${Math.round(((new Date() - dbUser.lastResetDate) / (1000 * 60)) * 10) / 10} min)`);
+              
+              // Apenas atualizar bytes, não verificar limite
+              await dbUser.update({
+                creditsUsed: newCreditsUsed,
+                currentSessionBytes: currentSessionBytes,
+                sessionId: activeSession.sessionId,
+                lastCollectionTime: new Date()
+              });
+              
+            } else {
+              // VERIFICAR LIMITE DE CRÉDITO
+              const willExceedLimit = newCreditsUsed >= dbUser.creditsTotal && dbUser.creditsTotal > 0;
+              
+              if (willExceedLimit && dbUser.status === 'active') {
+                console.log(`[LIMIT] '${dbUser.username}' excedeu limite: ${Math.round(newCreditsUsed/1024/1024)}MB/${Math.round(dbUser.creditsTotal/1024/1024)}MB`);
+                
+                // DESCONECTAR E DESATIVAR
+                await disconnectAndDisableUserUnified(dbUser, activeSession, mikrotikClient, company);
+                expiredCount++;
+                
+                await dbUser.update({
+                  creditsUsed: newCreditsUsed,
+                  currentSessionBytes: 0, // Reset pois foi desconectado
+                  sessionId: null,
+                  status: 'expired',
+                  lastCollectionTime: new Date()
+                });
+                
+              } else {
+                // ATUALIZAÇÃO NORMAL
+                await dbUser.update({
+                  creditsUsed: newCreditsUsed,
+                  currentSessionBytes: currentSessionBytes,
+                  sessionId: activeSession.sessionId,
+                  lastCollectionTime: new Date()
+                });
+              }
+            }
+            
+            console.log(`[COLLECT] '${dbUser.username}': +${Math.round(incremento/1024/1024*100)/100}MB (Total: ${Math.round(newCreditsUsed/1024/1024*100)/100}MB)`);
+            updatedCount++;
+            
+          } else if (incremento < 0) {
+            // NOVA SESSÃO DETECTADA (contadores resetaram)
+            console.log(`[NEW-SESSION] '${dbUser.username}': Nova sessão iniciada`);
+            
+            await dbUser.update({
+              currentSessionBytes: currentSessionBytes,
+              sessionId: activeSession.sessionId,
+              lastCollectionTime: new Date()
+            });
+          } else {
+            // SEM INCREMENTO - apenas atualizar timestamp
+            await dbUser.update({
+              sessionId: activeSession.sessionId,
+              lastCollectionTime: new Date()
+            });
+          }
+          
+        } else {
+          // ✅ USUÁRIO NÃO ESTÁ ATIVO - LIMPAR SESSÃO SE NECESSÁRIO
+          if (dbUser.sessionId) {
+            console.log(`[LOGOUT] '${dbUser.username}': Logout detectado`);
+            
+            // Se havia bytes de sessão pendentes, acumular
+            if (previousSessionBytes > 0) {
+              const finalCreditsUsed = dbUser.creditsUsed + previousSessionBytes;
+              
+              await dbUser.update({
+                creditsUsed: finalCreditsUsed,
+                currentSessionBytes: 0,
+                sessionId: null,
+                lastLogoutTime: new Date()
+              });
+              
+              console.log(`[LOGOUT] '${dbUser.username}': +${Math.round(previousSessionBytes/1024/1024*100)/100}MB final (Total: ${Math.round(finalCreditsUsed/1024/1024*100)/100}MB)`);
+              
+              // Verificar se excedeu após logout
+              if (finalCreditsUsed >= dbUser.creditsTotal && dbUser.creditsTotal > 0 && dbUser.status === 'active') {
+                await dbUser.update({ status: 'expired' });
+                console.log(`[LOGOUT] '${dbUser.username}': Marcado como expirado após logout`);
+              }
+              
+            } else {
+              // Logout sem bytes pendentes
+              await dbUser.update({
+                sessionId: null,
+                lastLogoutTime: new Date()
+              });
+            }
+          }
+        }
+        
+      } catch (userError) {
+        console.error(`[COLLECT] ❌ Erro ao processar '${dbUser.username}': ${userError.message}`);
+        errors++;
+      }
+    }
+
+    // 4. LOG DE RESULTADO
+    await ConnectionLog.create({
+      action,
+      status: 'success',
+      message: `Coleta concluída: ${updatedCount} atualizados, ${expiredCount} expirados, ${errors} erros`,
+      responseTime: Date.now() - startTime,
+      companyId
+    });
+
+    console.log(`[COLLECT-UNIFIED] ✅ Finalizado: ${updatedCount} atualizados, ${expiredCount} expirados, ${errors} erros`);
+
+    return {
+      syncedUsersInDB: updatedCount,
+      expiredUsers: expiredCount,
+      errors,
+      activeSessions: activeSessions.length,
+      totalUsers: dbUsers.length
+    };
+
+  } catch (error) {
+    const errorMessage = error.response?.data?.message || error.message;
+    console.error(`[COLLECT-UNIFIED] ❌ Erro geral: ${errorMessage}`);
+    
+    await ConnectionLog.create({
+      action,
+      status: 'error',
+      message: errorMessage,
+      responseTime: Date.now() - startTime,
+      companyId
+    });
+    
+    throw error;
+  }
+};
+
+// ✅ FUNÇÃO OTIMIZADA: Desconectar e desativar usuário
+const disconnectAndDisableUserUnified = async (dbUser, activeSession, mikrotikClient, company) => {
+  console.log(`[DISCONNECT-UNIFIED] Processando '${dbUser.username}'...`);
+  
+  try {
+    // 1. DESCONECTAR SESSÃO ATIVA
+    if (activeSession && activeSession.sessionId) {
+      try {
+        await mikrotikClient.post('/ip/hotspot/active/remove', {
+          '.id': activeSession.sessionId
+        }, {
+          headers: { 'Content-Type': 'application/json' }
+        });
+        console.log(`[DISCONNECT-UNIFIED] ✅ Sessão ${activeSession.sessionId} desconectada`);
+      } catch (sessionError) {
+        console.warn(`[DISCONNECT-UNIFIED] ⚠️ Erro ao desconectar sessão: ${sessionError.message}`);
+      }
+    }
+
+    // 2. DESATIVAR USUÁRIO
+    if (dbUser.mikrotikId) {
+      try {
+        await mikrotikClient.post('/ip/hotspot/user/set', {
+          '.id': dbUser.mikrotikId,
+          disabled: 'true'
+        }, {
+          headers: { 'Content-Type': 'application/json' }
+        });
+        console.log(`[DISCONNECT-UNIFIED] ✅ Usuário '${dbUser.username}' desativado`);
+      } catch (disableError) {
+        console.warn(`[DISCONNECT-UNIFIED] ⚠️ Erro ao desativar usuário: ${disableError.message}`);
+      }
+    }
+
+    // 3. ENVIAR EMAIL DE NOTIFICAÇÃO
+    try {
+      await sendCreditExhaustedEmail(dbUser, company);
+      console.log(`[DISCONNECT-UNIFIED] ✅ Email enviado para '${dbUser.username}'`);
+    } catch (emailError) {
+      console.warn(`[DISCONNECT-UNIFIED] ⚠️ Erro ao enviar email: ${emailError.message}`);
+    }
+
+    // 4. REGISTRAR LOG
+    await ConnectionLog.create({
+      action: 'disconnectAndDisableUserUnified',
+      status: 'success',
+      message: `Usuário '${dbUser.username}' desconectado e desativado por excesso de crédito (${Math.round(dbUser.creditsTotal/1024/1024)}MB)`,
+      companyId: company.id
+    });
+
+  } catch (error) {
+    console.error(`[DISCONNECT-UNIFIED] ❌ Erro geral: ${error.message}`);
+    
+    await ConnectionLog.create({
+      action: 'disconnectAndDisableUserUnified',
+      status: 'error',
+      message: `Falha ao processar '${dbUser.username}': ${error.message}`,
+      companyId: company.id
+    });
+  }
+};
+
+// ✅ FUNÇÃO SIMPLIFICADA: Desconectar usuário específico
+const forceDisconnectUserUnified = async (companyId, username) => {
+  const company = await Company.findByPk(companyId);
+  if (!company) throw new Error('Empresa não encontrada.');
+
+  const mikrotikClient = createMikrotikClient(company);
+
+  try {
+    // Buscar sessões ativas do usuário
+    const activeResponse = await mikrotikClient.get('/ip/hotspot/active');
+    const activeSessions = Array.isArray(activeResponse.data) ? activeResponse.data : [];
+    
+    const userSessions = activeSessions.filter(session => 
+      (session.user === username) || (session.name === username)
+    );
+    
+    if (userSessions.length === 0) {
+      return { 
+        success: false, 
+        message: `Usuário '${username}' não está conectado`,
+        sessionsFound: 0
+      };
+    }
+
+    console.log(`[FORCE-DISCONNECT] Encontradas ${userSessions.length} sessões para '${username}'`);
+
+    // Desconectar todas as sessões
+    const results = [];
+    for (const session of userSessions) {
+      try {
+        await mikrotikClient.post('/ip/hotspot/active/remove', {
+          '.id': session['.id'] || session.id
+        }, {
+          headers: { 'Content-Type': 'application/json' }
+        });
+        
+        results.push({
+          sessionId: session['.id'] || session.id,
+          address: session.address,
+          success: true
+        });
+        
+        console.log(`[FORCE-DISCONNECT] ✅ Sessão ${session['.id']} desconectada`);
+        
+      } catch (error) {
+        results.push({
+          sessionId: session['.id'] || session.id,
+          address: session.address,
+          success: false,
+          error: error.message
+        });
+        
+        console.warn(`[FORCE-DISCONNECT] ❌ Falha na sessão ${session['.id']}: ${error.message}`);
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    
+    // Atualizar usuário no banco
+    await HotspotUser.update({
+      sessionId: null,
+      currentSessionBytes: 0,
+      lastLogoutTime: new Date()
+    }, {
+      where: { username, companyId }
+    });
+
+    return {
+      success: successCount > 0,
+      message: `${successCount}/${userSessions.length} sessões desconectadas`,
+      sessionsFound: userSessions.length,
+      results
+    };
+
+  } catch (error) {
+    console.error(`[FORCE-DISCONNECT] Erro: ${error.message}`);
+    throw error;
+  }
+};
+
+// ✅ FUNÇÃO PARA TODAS AS EMPRESAS
+const collectUsageForAllCompaniesUnified = async () => {
+  console.log('[COLLECT-ALL] --- Iniciando coleta unificada para todas as empresas ---');
+  
+  const companies = await Company.findAll();
+  const results = [];
+
+  for (const company of companies) {
+    try {
+      console.log(`[COLLECT-ALL] Processando: ${company.name}`);
+      
+      const result = await collectUsageDataUnified(company.id);
+      
+      // Atualizar status da empresa
+      if (company.status !== 'online') {
+        await company.update({ status: 'online' });
+      }
+      
+      results.push({
+        company: company.name,
+        success: true,
+        ...result
+      });
+      
+      console.log(`[COLLECT-ALL] ✅ ${company.name}: ${result.syncedUsersInDB} usuários processados`);
+      
+    } catch (error) {
+      console.error(`[COLLECT-ALL] ❌ Erro em ${company.name}: ${error.message}`);
+      
+      // Marcar empresa como offline
+      if (company.status !== 'offline') {
+        await company.update({ status: 'offline' });
+      }
+      
+      results.push({
+        company: company.name,
+        success: false,
+        error: error.message
+      });
+    }
+    
+    // Pausa entre empresas para evitar sobrecarga
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  console.log(`[COLLECT-ALL] --- Finalizado: ${successCount}/${companies.length} empresas processadas ---`);
+  
+  return results;
+};
+
+// ✅ MANTER FUNÇÕES EXISTENTES (importação de perfis/usuários)
 const convertMikrotikTimeToMinutes = (mikrotikTime) => {
   if (!mikrotikTime || mikrotikTime === "0s" || mikrotikTime === "0" || mikrotikTime.toLowerCase() === "unlimited") return null;
   let totalMinutes = 0;
@@ -22,310 +426,21 @@ const convertMikrotikTimeToMinutes = (mikrotikTime) => {
   }
   return totalMinutes > 0 ? totalMinutes : null;
 };
+
 const convertMikrotikRateToString = (mikrotikRate) => {
   if (!mikrotikRate) return null;
   return mikrotikRate; 
 };
-// --- FUNÇÃO ESSENCIAL: extrair a turma do comentário do MikroTik ---
+
 const parseTurmaComment = (comment) => {
-    if (!comment) return 'Nenhuma'; // Valor padrão se o comentário for nulo ou vazio
-
+    if (!comment) return 'Nenhuma';
     const trimmedComment = comment.trim().toUpperCase();
-
-    // Prioriza "A" e "B"
-    if (trimmedComment.includes('TURMA A') || trimmedComment === 'A') {
-        return 'A';
-    }
-    if (trimmedComment.includes('TURMA B') || trimmedComment === 'B') {
-        return 'B';
-    }
-    
-    // Se não for "Turma A" ou "Turma B", retorna "Nenhuma"
+    if (trimmedComment.includes('TURMA A') || trimmedComment === 'A') return 'A';
+    if (trimmedComment.includes('TURMA B') || trimmedComment === 'B') return 'B';
     return 'Nenhuma'; 
 };
 
-const collectUsageData = async (companyId) => {
-  const company = await Company.findByPk(companyId);
-  if (!company) return { error: 'Empresa não encontrada.' };
-
-  const mikrotikClient = createMikrotikClient(company);
-  const startTime = Date.now();
-  const action = 'collectUsageData';
-
-  try {
-    const allUsersResponse = await mikrotikClient.get('/ip/hotspot/user');
-    const allUsersData = allUsersResponse.data;
-    const activeSessionsResponse = await mikrotikClient.get('/ip/hotspot/active');
-    const activeSessionsData = activeSessionsResponse.data;
-    
-    let updatedCount = 0;
-    const activeSessionsMap = new Map();
-    
-    // Mapear sessões ativas incluindo o ID da sessão
-    activeSessionsData.forEach(session => {
-        if (session.user) {
-            activeSessionsMap.set(session.user, {
-                sessionId: session['.id'], // ID da sessão para poder derrubá-la
-                bytesIn: parseInt(session['bytes-in'], 10) || 0,
-                bytesOut: parseInt(session['bytes-out'], 10) || 0,
-                address: session.address,
-                macAddress: session['mac-address']
-            });
-        }
-    });
-
-    for (const mikrotikUser of allUsersData) {
-      const dbUser = await HotspotUser.findOne({ where: { mikrotikId: mikrotikUser['.id'], companyId } });
-      if (!dbUser) continue;
-
-      const historicalBytesIn = parseInt(mikrotikUser['bytes-in'], 10) || 0;
-      const historicalBytesOut = parseInt(mikrotikUser['bytes-out'], 10) || 0;
-      let totalBytesUsed = historicalBytesIn + historicalBytesOut;
-
-      const activeSessionData = activeSessionsMap.get(mikrotikUser.name);
-      if (activeSessionData) {
-        // ATENÇÃO: A API do MikroTik `/ip/hotspot/user` já inclui os bytes da sessão ativa.
-        // Somar novamente os bytes da sessão ativa duplicaria a contagem.
-        // O valor de `totalBytesUsed` já é o correto e final.
-      }
-
-      // --- INÍCIO DA LÓGICA DE PERÍODO DE CARÊNCIA ---
-      if (dbUser.lastResetDate) {
-        const now = new Date();
-        const minutesSinceReset = (now.getTime() - dbUser.lastResetDate.getTime()) / (1000 * 60);
-        
-        // Se o reset ocorreu nos últimos 5 minutos, pule a verificação de desativação.
-        if (minutesSinceReset < 5) {
-          console.log(`[GRACE PERIOD] Usuário '${dbUser.username}' foi resetado recentemente. Verificação de excesso de crédito ignorada desta vez.`);
-          // Apenas atualiza os bytes usados e continua para o próximo usuário
-          await HotspotUser.update({ creditsUsed: totalBytesUsed }, { where: { id: dbUser.id } });
-          updatedCount++;
-          continue; // PULA PARA O PRÓXIMO USUÁRIO
-        }
-      }
-      // --- FIM DA LÓGICA DE PERÍODO DE CARÊNCIA ---
-
-      const hadCredit = dbUser.creditsTotal > 0 && dbUser.creditsUsed < dbUser.creditsTotal;
-      const creditExceeded = totalBytesUsed >= dbUser.creditsTotal && dbUser.creditsTotal > 0;
-
-      if (hadCredit && creditExceeded && dbUser.status === 'active') {
-        console.log(`Crédito excedido para ${dbUser.username}. Desativando e desconectando no MikroTik...`);
-        try {
-          // 1. DESATIVAR o usuário no MikroTik
-          await mikrotikClient.post('/ip/hotspot/user/set', 
-            {
-              '.id': dbUser.mikrotikId,
-              disabled: 'true'
-            },
-            {
-              headers: {
-                'Content-Type': 'application/json'
-              }
-            }
-          );
-          console.log(`✅ Usuário ${dbUser.username} desativado no MikroTik`);
-
-          // 2. DERRUBAR a sessão ativa se existir
-          if (activeSessionData && activeSessionData.sessionId) {
-            try {
-              await mikrotikClient.post('/ip/hotspot/active/remove', { '.id': activeSessionData.sessionId }, { headers: { 'Content-Type': 'application/json' } });
-              console.log(`✅ Sessão ativa do usuário ${dbUser.username} derrubada (ID: ${activeSessionData.sessionId})`);
-            } catch (sessionError) {
-                console.warn(`⚠️ Falha ao derrubar sessão de ${dbUser.username}:`, sessionError.message);
-            }
-          } else {
-            console.log(`ℹ️ Usuário ${dbUser.username} não possui sessão ativa para derrubar`);
-          }
-
-          // 3. Registrar sucesso e atualizar banco
-          await ConnectionLog.create({ 
-            action: 'disableUserAndDisconnect', 
-            status: 'success', 
-            message: `Usuário ${dbUser.username} desativado e desconectado por excesso de crédito.`, 
-            companyId 
-          });
-          
-          await dbUser.update({ status: 'expired' });
-          sendCreditExhaustedEmail({ ...dbUser.get({ plain: true }), creditsUsed: totalBytesUsed }, company);
-
-        } catch(disableError) {
-          const disableErrorMessage = disableError.response?.data?.message || disableError.message;
-          console.error(`❌ Falha ao tentar desativar o usuário ${dbUser.username} no MikroTik. Erro: ${disableErrorMessage}`);
-          
-          await ConnectionLog.create({ 
-            action: 'disableUser', 
-            status: 'error', 
-            message: `Falha ao desativar usuário: ${disableErrorMessage}`, 
-            companyId 
-          });
-        }
-      }
-      
-      const [affectedRows] = await HotspotUser.update({ creditsUsed: totalBytesUsed }, { where: { id: dbUser.id } });
-      if (affectedRows > 0) updatedCount++;
-    }
-    return { syncedUsersInDB: updatedCount };
-
-  } catch (error) {
-    const errorMessage = error.response?.data?.message || error.message;
-    await ConnectionLog.create({ action, status: 'error', message: errorMessage, responseTime: Date.now() - startTime, companyId });
-    throw error;
-  }
-};
-
-// Função utilitária separada para desconectar usuários
-const forceDisconnectUser = async (companyId, username) => {
-  const company = await Company.findByPk(companyId);
-  if (!company) throw new Error('Empresa não encontrada.');
-
-  const mikrotikClient = createMikrotikClient(company);
-
-  try {
-    // Buscar todas as sessões ativas
-    const activeSessionsResponse = await mikrotikClient.get('/ip/hotspot/active');
-    const activeSessions = activeSessionsResponse.data;
-    
-    // Filtrar sessões do usuário específico
-    const userSessions = activeSessions.filter(session => session.user === username);
-    
-    if (userSessions.length === 0) {
-      console.log(`Usuário ${username} não possui sessões ativas`);
-      return { success: false, message: `Usuário ${username} não está conectado` };
-    }
-
-    console.log(`Encontradas ${userSessions.length} sessões ativas para ${username}`);
-
-    // Derrubar todas as sessões do usuário
-    const results = [];
-    for (const session of userSessions) {
-      try {
-        await mikrotikClient.delete(`/ip/hotspot/active/${session['.id']}`);
-        results.push({ 
-          sessionId: session['.id'], 
-          address: session.address, 
-          success: true 
-        });
-        console.log(`✅ Sessão ${session['.id']} (${session.address}) derrubada`);
-      } catch (error) {
-        results.push({ 
-          sessionId: session['.id'], 
-          address: session.address, 
-          success: false, 
-          error: error.message 
-        });
-        console.warn(`❌ Falha ao derrubar sessão ${session['.id']}:`, error.message);
-      }
-    }
-
-    const successCount = results.filter(r => r.success).length;
-    
-    return { 
-      success: successCount > 0, 
-      message: `${successCount}/${userSessions.length} sessões derrubadas para ${username}`,
-      results 
-    };
-
-  } catch (error) {
-    console.error(`Erro ao desconectar usuário ${username}:`, error.message);
-    throw error;
-  }
-};
-
-// Função para desativar usuário completamente (desativar + desconectar)
-const disableAndDisconnectUser = async (companyId, username) => {
-  const company = await Company.findByPk(companyId);
-  if (!company) throw new Error('Empresa não encontrada.');
-
-  const mikrotikClient = createMikrotikClient(company);
-  
-  try {
-    // 1. Buscar o usuário no banco de dados
-    const dbUser = await HotspotUser.findOne({ 
-      where: { username, companyId } 
-    });
-    
-    if (!dbUser || !dbUser.mikrotikId) {
-      throw new Error(`Usuário ${username} não encontrado no banco de dados`);
-    }
-
-    console.log(`Desativando usuário ${username} completamente...`);
-
-    // 2. Desativar no MikroTik
-    await mikrotikClient.patch(`/ip/hotspot/user/${dbUser.mikrotikId}`, 
-      { disabled: 'true' },
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-    console.log(`✅ Usuário ${username} desativado no MikroTik`);
-
-    // 3. Derrubar todas as sessões ativas
-    const disconnectResult = await forceDisconnectUser(companyId, username);
-    
-    // 4. Atualizar status no banco de dados
-    await dbUser.update({ status: 'inactive' });
-    console.log(`✅ Status do usuário ${username} atualizado no banco`);
-
-    // 5. Registrar log
-    await ConnectionLog.create({
-      action: 'disableAndDisconnectUser',
-      status: 'success',
-      message: `Usuário ${username} desativado e ${disconnectResult.message}`,
-      companyId
-    });
-
-    return {
-      userDisabled: true,
-      sessionsDisconnected: disconnectResult.success,
-      message: `Usuário ${username} desativado completamente`,
-      disconnectDetails: disconnectResult
-    };
-
-  } catch (error) {
-    console.error(`Erro ao desativar usuário ${username}:`, error.message);
-    
-    await ConnectionLog.create({
-      action: 'disableAndDisconnectUser',
-      status: 'error',
-      message: `Erro ao desativar usuário ${username}: ${error.message}`,
-      companyId
-    });
-    
-    throw error;
-  }
-};
-
-
-
-const collectUsageForAllCompanies = async () => {
-  console.log('--- Iniciando job: Coleta de Uso Para Todas as Empresas ---');
-  const companies = await Company.findAll();
-  
-  const results = await Promise.allSettled(
-    companies.map(async company => {
-        try {
-            const result = await collectUsageData(company.id);
-            if (company.status !== 'online') {
-                await company.update({ status: 'online' });
-            }
-            return result;
-        } catch (error) {
-            if (company.status !== 'offline') {
-                await company.update({ status: 'offline' });
-            }
-            throw error; // Re-lança o erro para ser capturado como 'rejected'
-        }
-    })
-  );
-
-  results.forEach((result, index) => {
-    if (result.status === 'fulfilled' && result.value) {
-      console.log(`[${new Date().toISOString()}] SUCESSO na coleta para a empresa ${companies[index].name}. Sincronizados: ${result.value.syncedUsersInDB}`);
-    } else {
-      console.error(`[${new Date().toISOString()}] FALHA na coleta para a empresa ${companies[index].name}. Erro: ${result.reason?.message || 'Erro desconhecido'}`);
-    }
-  });
-  console.log('--- Finalizado job: Coleta de Uso Para Todas as Empresas ---');
-};
-
+// MANTER AS OUTRAS FUNÇÕES EXISTENTES INALTERADAS
 const importProfilesFromMikrotik = async (companyId) => {
   const company = await Company.findByPk(companyId);
   if (!company) throw new Error('Empresa não encontrada.');
@@ -420,10 +535,8 @@ const importUsersFromMikrotik = async (companyId) => {
       hashedPasswordForNewUser = await bcrypt.hash(mikrotikUser.password, salt);
     } else {
         const salt = await bcrypt.genSalt(10);
-        hashedPasswordForNewUser = await bcrypt.hash('imported_user', salt); // Senha padrão
+        hashedPasswordForNewUser = await bcrypt.hash('imported_user', salt);
     }
-
-    const creditsUsed = 0;
 
     let statusFromMikrotik = 'active';
     if (mikrotikUser.disabled === 'true') {
@@ -493,8 +606,6 @@ const findAllLogs = async (options) => {
   
   const offset = (page - 1) * limit;
   
-  // Esta função busca os logs da tabela ConnectionLogs e inclui dados da Company.
-  // Ela não depende do companyService, o que é o correto.
   return await ConnectionLog.findAndCountAll({
     where,
     include: [{
@@ -526,15 +637,26 @@ const findNetworkNeighbors = async (companyId) => {
   }
 };
 
-
-
-
 module.exports = {
-  collectUsageData,
-  collectUsageForAllCompanies,
+  // ✅ FUNÇÕES UNIFICADAS PRINCIPAIS
+  collectUsageDataUnified,
+  collectUsageForAllCompaniesUnified,
+  disconnectAndDisableUserUnified,
+  forceDisconnectUserUnified,
+  
+  // ✅ FUNÇÕES ORIGINAIS MANTIDAS
   importProfilesFromMikrotik,
   importUsersFromMikrotik,
   findAllLogs,
   findNetworkNeighbors,
   
+  // ✅ FUNÇÕES DE COMPATIBILIDADE (podem ser removidas depois)
+  collectUsageData: collectUsageDataUnified,
+  collectUsageForAllCompanies: collectUsageForAllCompaniesUnified,
+  forceDisconnectUser: forceDisconnectUserUnified,
+  
+  // ✅ UTILITÁRIOS
+  convertMikrotikTimeToMinutes,
+  convertMikrotikRateToString,
+  parseTurmaComment
 };

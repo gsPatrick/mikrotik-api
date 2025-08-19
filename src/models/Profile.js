@@ -1,4 +1,4 @@
-// src/models/Profile.js
+// src/models/Profile.js - VERSÃO CORRIGIDA
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/database');
 
@@ -25,6 +25,15 @@ const Profile = sequelize.define('Profile', {
     type: DataTypes.STRING,
     allowNull: false,
   },
+}, {
+  indexes: [
+    // Garante que o nome do perfil do MikroTik seja único dentro de uma empresa.
+    // Isso permite que 'Default' exista em Empresa A e 'Default' em Empresa B.
+    {
+      unique: true,
+      fields: ['mikrotikName', 'companyId']
+    }
+  ]
 });
 
 module.exports = Profile;

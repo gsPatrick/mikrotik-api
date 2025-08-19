@@ -19,7 +19,6 @@ const HotspotUser = sequelize.define('HotspotUser', {
   // O ID do usuário como ele existe no MikroTik (ex: "*1A")
   mikrotikId: {
     type: DataTypes.STRING,
-    unique: true,
     allowNull: true, // Pode ser nulo até a primeira sincronização
   },
   creditsTotal: {

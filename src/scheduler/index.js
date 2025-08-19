@@ -1,17 +1,15 @@
-// src/scheduler/index.js
+// ==========================================
+// 1. CORREÇÃO DO SCHEDULER (src/scheduler/index.js)
+// ==========================================
+
 const cron = require('node-cron');
 const { getSettings } = require('../features/settings/settings.service');
 const mikrotikService = require('../features/mikrotik/mikrotik.service');
 const hotspotUserService = require('../features/hotspotUser/hotspotUser.service');
 const { Company } = require('../models');
 
-// Objeto para manter uma referência das tarefas agendadas e poder pará-las
 let scheduledTasks = {};
 
-/**
- * Para uma tarefa específica se ela estiver rodando.
- * @param {string} taskName - O nome da tarefa (ex: 'usageCollection')
- */
 const stopTask = (taskName) => {
   if (scheduledTasks[taskName]) {
     scheduledTasks[taskName].stop();
@@ -20,18 +18,10 @@ const stopTask = (taskName) => {
   }
 };
 
-/**
- * Inicia uma tarefa com um horário específico.
- * @param {string} taskName - O nome da tarefa.
- * @param {string} schedule - A expressão cron.
- * @param {function} jobFunction - A função a ser executada.
- */
 const startTask = (taskName, schedule, jobFunction) => {
-  // Para a tarefa antiga antes de iniciar uma nova, para evitar duplicatas
   stopTask(taskName);
 
   if (cron.validate(schedule)) {
-    // Agenda a tarefa usando o fuso horário do servidor (sem a opção timezone)
     const task = cron.schedule(schedule, jobFunction);
     scheduledTasks[taskName] = task;
     console.log(`[Scheduler] Tarefa '${taskName}' agendada (horário do servidor): [${schedule}]`);
@@ -40,10 +30,6 @@ const startTask = (taskName, schedule, jobFunction) => {
   }
 };
 
-/**
- * Lê as configurações do banco e agenda/reagenda todas as tarefas.
- * Esta função é chamada na inicialização e sempre que as configurações são salvas.
- */
 const rescheduleAllTasks = async () => {
   console.log('🔄 Lendo configurações e (re)agendando todas as tarefas...');
   try {
@@ -58,13 +44,25 @@ const rescheduleAllTasks = async () => {
         hotspotUserService.resetDailyCreditsForAllUsers();
     });
     
-    // Tarefa 2: Coleta de uso de dados
+    // ✅ CORREÇÃO: Usar a função corrigida do hotspotUserService
     startTask('usageCollection', settings.usageCollectionCron, () => {
-        console.log(`[${new Date().toISOString()}] Executando job: Coleta de Uso...`);
-        mikrotikService.collectUsageForAllCompanies();
+        console.log(`[${new Date().toISOString()}] Executando job: Coleta de Uso de Sessões Ativas...`);
+        hotspotUserService.collectActiveSessionUsage();
     });
     
-    // Tarefa 3: Sincronização de Dados do MikroTik
+    // ✅ NOVA TAREFA: Monitoramento de logouts
+    startTask('logoutMonitoring', '*/2 * * * *', () => { // A cada 2 minutos
+        console.log(`[${new Date().toISOString()}] Executando job: Monitoramento de Logouts...`);
+        hotspotUserService.monitorUserLogouts();
+    });
+
+    // ✅ NOVA TAREFA: Limpeza de sessões órfãs
+    startTask('sessionCleanup', '*/5 * * * *', () => { // A cada 5 minutos
+        console.log(`[${new Date().toISOString()}] Executando job: Limpeza de Sessões Órfãs...`);
+        hotspotUserService.cleanupOrphanedSessions();
+    });
+    
+    // Tarefa 3: Sincronização de Dados do MikroTik (mantida)
     startTask('mikrotikDataSync', settings.mikrotikDataSyncCron, async () => {
         console.log(`[${new Date().toISOString()}] Executando job: Sincronização de Dados MikroTik...`);
         const companies = await Company.findAll({ attributes: ['id', 'name'] });
@@ -83,19 +81,13 @@ const rescheduleAllTasks = async () => {
   }
 };
 
-
-/**
- * Função de inicialização, chamada apenas uma vez quando o servidor sobe.
- */
 const initScheduler = async () => {
   console.log('⏰ Inicializando o agendador de tarefas...');
-  // Chama a função principal de agendamento.
   await rescheduleAllTasks();
   console.log('✅ Agendador pronto!');
 };
 
 module.exports = { 
   initScheduler,
-  // Exporta a função para que a API de settings possa chamá-la.
   rescheduleAllTasks 
 };

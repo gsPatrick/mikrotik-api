@@ -688,11 +688,16 @@ const collectActiveSessionUsage = async () => {
       const mikrotikClient = createMikrotikClient(company);
       
       try {
-        // ✅ CORREÇÃO: Buscar usuários ATIVOS usando padrão dos outros arquivos
-        const activeUsersResponse = await mikrotikClient.get('/ip/hotspot/active');
-        const activeUsers = activeUsersResponse.data || [];
+        console.log(`[COLLECT] Processando empresa: '${company.name}'`);
         
-        console.log(`[COLLECT] Empresa '${company.name}': ${activeUsers.length} usuários ativos`);
+        const activeUsersResponse = await mikrotikClient.get('/ip/hotspot/active');
+        const activeUsers = Array.isArray(activeUsersResponse.data) ? activeUsersResponse.data : [];
+        
+        console.log(`[COLLECT] Empresa '${company.name}': ${activeUsers.length} usuários ativos encontrados`);
+        
+        if (activeUsers.length > 0) {
+          console.log(`[COLLECT] Exemplo de dados do primeiro usuário:`, { raw: activeUsers[0] });
+        }
         
         for (const activeUser of activeUsers) {
           try {
@@ -701,8 +706,9 @@ const collectActiveSessionUsage = async () => {
             const bytesIn = parseInt(activeUser['bytes-in'] || 0);
             const bytesOut = parseInt(activeUser['bytes-out'] || 0);
             const currentSessionBytes = bytesIn + bytesOut;
-            
-            // Buscar usuário no banco
+
+            if (!username) continue;
+
             const hotspotUser = await HotspotUser.findOne({
               where: { username, companyId: company.id }
             });
@@ -712,14 +718,20 @@ const collectActiveSessionUsage = async () => {
               continue;
             }
             
-            // ✅ VALIDAÇÃO: Só processar se diferença >= 1MB
-            const previousSessionUsage = hotspotUser.currentSessionBytes || 0;
-            const incremento = currentSessionBytes - previousSessionUsage;
-            const MIN_INCREMENT = 1024 * 1024; // 1MB
+            // ==================== INÍCIO DA CORREÇÃO ====================
+            // GARANTIR QUE OS VALORES DO BANCO SEJAM NÚMEROS ANTES DE CALCULAR
+            const dbCreditsUsed = parseFloat(hotspotUser.creditsUsed) || 0;
+            const dbCurrentSessionBytes = parseFloat(hotspotUser.currentSessionBytes) || 0;
+            // ===================== FIM DA CORREÇÃO ======================
+
+            const incremento = currentSessionBytes - dbCurrentSessionBytes;
             
-            if (incremento >= MIN_INCREMENT) {
-              const novoTotal = hotspotUser.creditsUsed + incremento;
-              
+            if (incremento > 0) {
+              // ==================== INÍCIO DA CORREÇÃO ====================
+              // USAR O VALOR NUMÉRICO GARANTIDO
+              const novoTotal = dbCreditsUsed + incremento;
+              // ===================== FIM DA CORREÇÃO ======================
+
               await hotspotUser.update({
                 creditsUsed: novoTotal,
                 currentSessionBytes: currentSessionBytes,
@@ -729,25 +741,15 @@ const collectActiveSessionUsage = async () => {
               
               console.log(`[COLLECT] ✅ '${username}': +${Math.round(incremento/1024/1024*100)/100}MB (Total: ${Math.round(novoTotal/1024/1024*100)/100}MB/${Math.round(hotspotUser.creditsTotal/1024/1024*100)/100}MB)`);
               
-              // ✅ VERIFICAR SE EXCEDEU LIMITE
               if (novoTotal >= hotspotUser.creditsTotal) {
                 console.log(`[COLLECT] 🚨 '${username}' excedeu limite! Desconectando...`);
                 await disconnectAndDisableUser(hotspotUser, company, mikrotikClient);
               }
               
               totalProcessed++;
-            } else if (incremento > 0) {
-              // Atualizar apenas currentSessionBytes sem registrar no total (menor que 1MB)
-              await hotspotUser.update({
-                currentSessionBytes: currentSessionBytes,
-                sessionId: sessionId,
-                lastCollectionTime: new Date()
-              });
-              
-              console.log(`[COLLECT] ⏸️ '${username}': +${Math.round(incremento/1024*100)/100}KB (aguardando 1MB)`);
             } else {
-              // Apenas atualizar sessionId e timestamp se não havia antes
-              if (!hotspotUser.sessionId) {
+              // Se não houve incremento, apenas atualiza o sessionId se for novo
+              if (hotspotUser.sessionId !== sessionId) {
                 await hotspotUser.update({
                   sessionId: sessionId,
                   lastCollectionTime: new Date()
@@ -756,14 +758,9 @@ const collectActiveSessionUsage = async () => {
             }
             
           } catch (userError) {
-            console.error(`[COLLECT] ❌ Erro ao processar usuário: ${userError.message}`);
+            console.error(`[COLLECT] ❌ Erro ao processar usuário '${activeUser.user}': ${userError.message}`);
             totalErrors++;
           }
-        }
-        
-        // Pequena pausa entre empresas
-        if (activeUsers.length > 0) {
-          await new Promise(resolve => setTimeout(resolve, 200));
         }
         
       } catch (companyError) {
@@ -780,6 +777,142 @@ const collectActiveSessionUsage = async () => {
     console.error(`[COLLECT] ❌ Erro geral na coleta: ${error.message}`);
   }
 };
+
+// ✅ FUNÇÃO ALTERNATIVA: Buscar dados específicos do usuário
+const getSpecificUserData = async (username, company) => {
+  try {
+    const mikrotikClient = createMikrotikClient(company);
+    
+    // Método 1: Buscar por parâmetro específico
+    const response1 = await mikrotikClient.get('/ip/hotspot/active', {
+      params: {
+        '?user': username
+      }
+    });
+    
+    console.log(`[SPECIFIC] Método 1 para '${username}':`, response1.data);
+    
+    // Método 2: Buscar todos e filtrar
+    const response2 = await mikrotikClient.get('/ip/hotspot/active');
+    const allUsers = Array.isArray(response2.data) ? response2.data : [];
+    const specificUser = allUsers.find(u => u.user === username || u.name === username);
+    
+    console.log(`[SPECIFIC] Método 2 para '${username}':`, specificUser);
+    
+    return specificUser;
+    
+  } catch (error) {
+    console.error(`[SPECIFIC] Erro ao buscar dados específicos: ${error.message}`);
+    return null;
+  }
+};
+
+// ✅ FUNÇÃO DE DEBUG: Verificar estrutura de dados do MikroTik
+const debugMikrotikActiveUsers = async () => {
+  console.log(`[DEBUG] Verificando estrutura de dados do MikroTik...`);
+  
+  try {
+    const companies = await Company.findAll();
+    
+    for (const company of companies) {
+      const mikrotikClient = createMikrotikClient(company);
+      
+      try {
+        const response = await mikrotikClient.get('/ip/hotspot/active');
+        const activeUsers = response.data || [];
+        
+        console.log(`\n=== EMPRESA: ${company.name} ===`);
+        console.log(`Usuários ativos: ${activeUsers.length}`);
+        console.log(`Resposta bruta:`, JSON.stringify(response.data, null, 2));
+        
+        if (activeUsers.length > 0) {
+          console.log(`\n--- ESTRUTURA DO PRIMEIRO USUÁRIO ---`);
+          const firstUser = activeUsers[0];
+          console.log(`Dados brutos:`, firstUser);
+          console.log(`Campos disponíveis:`, Object.keys(firstUser));
+          
+          // Testar diferentes campos possíveis
+          const possibleFields = [
+            'user', 'name', 'username',
+            'bytes-in', 'bytesIn', 'bytes_in', 'upload',
+            'bytes-out', 'bytesOut', 'bytes_out', 'download',
+            '.id', 'id', 'session-id'
+          ];
+          
+          console.log(`\n--- VALORES DOS CAMPOS ---`);
+          possibleFields.forEach(field => {
+            if (firstUser.hasOwnProperty(field)) {
+              console.log(`${field}: ${firstUser[field]}`);
+            }
+          });
+        }
+        
+      } catch (error) {
+        console.error(`[DEBUG] Erro na empresa '${company.name}': ${error.message}`);
+      }
+    }
+    
+  } catch (error) {
+    console.error(`[DEBUG] Erro geral: ${error.message}`);
+  }
+};
+
+// ✅ FUNÇÃO PARA TESTAR CONEXÃO E FORMATO DOS DADOS
+const testMikrotikConnection = async (companyId) => {
+  try {
+    const company = await Company.findByPk(companyId);
+    if (!company) {
+      console.error('[TEST] Empresa não encontrada');
+      return;
+    }
+    
+    const mikrotikClient = createMikrotikClient(company);
+    
+    console.log(`[TEST] Testando conexão com MikroTik da empresa: ${company.name}`);
+    console.log(`[TEST] Configurações:`, {
+      host: company.mikrotikHost,
+      port: company.mikrotikPort,
+      // Não exibir credenciais por segurança
+    });
+    
+    // Teste 1: Buscar informações do sistema
+    try {
+      const systemResponse = await mikrotikClient.get('/system/resource');
+      console.log(`[TEST] ✅ Conexão OK - Sistema:`, {
+        version: systemResponse.data?.version,
+        uptime: systemResponse.data?.uptime
+      });
+    } catch (error) {
+      console.error(`[TEST] ❌ Falha na conexão: ${error.message}`);
+      return;
+    }
+    
+    // Teste 2: Buscar usuários ativos
+    try {
+      const activeResponse = await mikrotikClient.get('/ip/hotspot/active');
+      console.log(`[TEST] Usuários ativos encontrados: ${activeResponse.data?.length || 0}`);
+      
+      if (activeResponse.data && activeResponse.data.length > 0) {
+        console.log(`[TEST] Exemplo de dados:`, activeResponse.data[0]);
+      }
+      
+    } catch (error) {
+      console.error(`[TEST] ❌ Erro ao buscar usuários ativos: ${error.message}`);
+    }
+    
+    // Teste 3: Buscar todos os usuários do hotspot
+    try {
+      const usersResponse = await mikrotikClient.get('/ip/hotspot/user');
+      console.log(`[TEST] Total de usuários cadastrados: ${usersResponse.data?.length || 0}`);
+    } catch (error) {
+      console.error(`[TEST] ❌ Erro ao buscar usuários: ${error.message}`);
+    }
+    
+  } catch (error) {
+    console.error(`[TEST] ❌ Erro geral no teste: ${error.message}`);
+  }
+};
+
 
 const monitorUserLogouts = async () => {
   console.log(`[MONITOR] Verificando logouts...`);
@@ -1073,5 +1206,8 @@ module.exports = {
   monitorUserLogouts,              
   captureUserLogout,               
   cleanupOrphanedSessions,         
-  syncUserCountersWithMikrotik
+  syncUserCountersWithMikrotik,
+    getSpecificUserData,
+  debugMikrotikActiveUsers,
+  testMikrotikConnection
 };
