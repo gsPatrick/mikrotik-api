@@ -468,27 +468,41 @@ const resetExpiredUser = async (user, newCreditBytes) => {
   console.log(`[RESET-INDIVIDUAL] ✅ Dados de '${user.username}' resetados no banco.`);
 };
 // Função principal que orquestra o processo.
+
+/**
+ * Job agendado para resetar os créditos dos usuários diariamente, implementando a
+ * lógica de "passe diário" com reativação automática.
+ *
+ * LÓGICA APLICADA:
+ * 1. A cada ciclo (ex: 03:00 UTC), a função roda para TODOS os usuários.
+ * 2. O status anterior (seja 'active', 'inactive' ou 'expired') é desconsiderado.
+ * 3. O novo status ('active' ou 'inactive') é SEMPRE recalculado com base na turma.
+ *    - Se a turma do usuário está ativa, ele se tornará 'active'.
+ *    - Se a turma não está ativa, ele se tornará 'inactive'.
+ * 4. O crédito é renovado (resetado ou acumulado, conforme a configuração).
+ * 5. Se o status final for diferente do anterior (ex: de 'expired' para 'active'),
+ *    um comando é enviado ao MikroTik para habilitar ou desabilitar o usuário.
+ */
 const resetDailyCreditsForAllUsers = async () => {
-  console.log(`--- Iniciando job: Reset Diário de Créditos (Lógica Unificada Final) ---`);
+  console.log(`--- Iniciando job: Reset Diário com Reativação Automática ---`);
   
   try {
     const settings = await Settings.findByPk(1);
     if (!settings) {
-      console.error('[RESET] FALHA: Configurações do sistema não encontradas.');
+      console.error('[RESET] FALHA CRÍTICA: Configurações do sistema (ID: 1) não encontradas.');
       return;
     }
 
-    const { defaultDailyCreditMB } = settings;
+    const { defaultDailyCreditMB, creditMode } = settings;
     const newCreditBytes = defaultDailyCreditMB * 1024 * 1024;
-    console.log(`[RESET] Crédito padrão a ser aplicado: ${defaultDailyCreditMB}MB.`);
+    console.log(`[RESET] Configuração: Crédito diário de ${defaultDailyCreditMB}MB. Modo: '${creditMode}'.`);
 
-    // 1. BUSCAR TODOS OS USUÁRIOS UMA ÚNICA VEZ
     const allUsers = await HotspotUser.findAll({
       include: [{ model: Company, as: 'company' }]
     });
 
     if (allUsers.length === 0) {
-      console.log('[RESET] Nenhum usuário encontrado.');
+      console.log('[RESET] Nenhum usuário encontrado. Job concluído.');
       return;
     }
 
@@ -496,60 +510,62 @@ const resetDailyCreditsForAllUsers = async () => {
 
     for (const user of allUsers) {
       try {
-        const wasExpired = user.status === 'expired';
-        let newTotalCredit;
-
-        // 2. APLICA A REGRA DE CRÉDITO BASEADO NO STATUS *INICIAL*
-        if (wasExpired) {
-          // SE ESTAVA EXPIRADO, RESETA.
-          console.log(`[RESET][EXPIRADO] Usuário '${user.username}'.`);
-          newTotalCredit = newCreditBytes;
-        } else {
-          // SE NÃO ESTAVA EXPIRADO, ACUMULA.
-          const remainingCredit = Math.max(0, user.creditsTotal - user.creditsUsed);
-          newTotalCredit = remainingCredit + newCreditBytes;
-          console.log(`[RESET][ACUMULOU] Usuário '${user.username}'.`);
-        }
-        
-        // 3. DEFINE O STATUS FINAL BASEADO NA TURMA
-        const userTurma = user.turma || 'Nenhuma';
-        const activeCompanyTurma = user.company ? (user.company.activeTurma || 'Nenhuma') : 'Nenhuma';
-        const finalStatus = (activeCompanyTurma === 'Nenhuma' || userTurma === activeCompanyTurma) ? 'active' : 'inactive';
-
-        // 4. PREPARA O PACOTE COMPLETO PARA ATUALIZAÇÃO
         const dataToUpdate = {
-          creditsUsed: 0,
-          creditsTotal: newTotalCredit,
-          status: finalStatus,
           lastResetDate: new Date()
         };
 
-        // 5. ATUALIZA O MIKROTIK SE O STATUS MUDOU
-        if (finalStatus !== user.status) {
-          console.log(`[RESET][MIKROTIK] Status de '${user.username}' mudando de '${user.status}' para '${finalStatus}'.`);
-          if (user.mikrotikId && user.company) {
-            const mikrotikClient = createMikrotikClient(user.company);
-            const payload = { 
-              '.id': user.mikrotikId, 
-              disabled: (finalStatus === 'inactive').toString() 
-            };
-            await mikrotikClient.post('/ip/hotspot/user/set', payload, { headers: { 'Content-Type': 'application/json' } });
-            console.log(`[RESET][MIKROTIK] ✅ Comando enviado: disabled=${payload.disabled}.`);
-          }
+        // =========================================================================
+        // LÓGICA DE RENOVAÇÃO E REATIVAÇÃO
+        // =========================================================================
+
+        // 1. CALCULAR O NOVO CRÉDITO TOTAL
+        if (creditMode === 'accumulate') {
+          const remainingCredit = Math.max(0, user.creditsTotal - user.creditsUsed);
+          dataToUpdate.creditsTotal = remainingCredit + newCreditBytes;
+        } else { // modo 'reset'
+          dataToUpdate.creditsTotal = newCreditBytes;
         }
         
-        // 6. ATUALIZA O BANCO UMA ÚNICA VEZ POR USUÁRIO
+        // 2. ZERAR O CRÉDITO USADO
+        dataToUpdate.creditsUsed = 0;
+
+        // 3. RECALCULAR O STATUS A PARTIR DO ZERO, BASEADO APENAS NA TURMA
+        // Isso garante que um usuário 'expired' seja reavaliado e possa se tornar 'active'.
+        const userTurma = user.turma || 'Nenhuma';
+        const activeCompanyTurma = user.company ? (user.company.activeTurma || 'Nenhuma') : 'Nenhuma';
+        const shouldBeActive = (activeCompanyTurma === 'Nenhuma' || userTurma === activeCompanyTurma);
+        const finalStatus = shouldBeActive ? 'active' : 'inactive';
+        dataToUpdate.status = finalStatus;
+        
+        // 4. SINCRONIZAR COM O MIKROTIK SE O ESTADO MUDOU
+        // Se o usuário era 'expired' e agora é 'active', o comando para habilitá-lo será enviado.
+        if (user.mikrotikId && user.company && dataToUpdate.status !== user.status) {
+          console.log(`[RESET][MIKROTIK] Status de '${user.username}' mudando de '${user.status}' para '${dataToUpdate.status}'.`);
+          const mikrotikClient = createMikrotikClient(user.company);
+          
+          const isDisabled = (dataToUpdate.status === 'inactive' || dataToUpdate.status === 'expired');
+
+          const payload = { 
+            '.id': user.mikrotikId, 
+            disabled: isDisabled.toString() // 'true' se inativo/expirado, 'false' se ativo
+          };
+          await mikrotikClient.post('/ip/hotspot/user/set', payload, { headers: { 'Content-Type': 'application/json' } });
+          console.log(`[RESET][MIKROTIK] ✅ Comando enviado para '${user.username}': disabled=${payload.disabled}`);
+        }
+
+        // 5. ATUALIZAR O BANCO DE DADOS
         await user.update(dataToUpdate);
+        console.log(`[RESET] ✅ Usuário '${user.username}' processado. Novo status: '${dataToUpdate.status}', Novo limite: ${Math.round(dataToUpdate.creditsTotal/1024/1024)}MB.`);
 
       } catch (error) {
-        console.error(`[RESET] ❌ ERRO ao processar '${user.username}': ${error.message}`);
+        console.error(`[RESET] ❌ ERRO ao processar o usuário '${user.username}': ${error.message}`);
       }
     }
 
-    console.log(`--- Finalizado job: Reset Diário de Créditos ---`);
+    console.log(`--- Finalizado job: Reset Diário com Reativação Automática ---`);
 
   } catch (error) {
-    console.error(`[RESET] ❌ FALHA GERAL no job: ${error.message}`);
+    console.error(`[RESET] ❌ FALHA GERAL no job de reset: ${error.message}`);
   }
 };
 
@@ -689,25 +705,19 @@ const collectActiveSessionUsage = async () => {
       
       try {
         console.log(`[COLLECT] Processando empresa: '${company.name}'`);
-        
         const activeUsersResponse = await mikrotikClient.get('/ip/hotspot/active');
         const activeUsers = Array.isArray(activeUsersResponse.data) ? activeUsersResponse.data : [];
-        
         console.log(`[COLLECT] Empresa '${company.name}': ${activeUsers.length} usuários ativos encontrados`);
-        
-        if (activeUsers.length > 0) {
-          console.log(`[COLLECT] Exemplo de dados do primeiro usuário:`, { raw: activeUsers[0] });
-        }
-        
+
         for (const activeUser of activeUsers) {
           try {
             const username = activeUser.user;
+            if (!username) continue;
+
             const sessionId = activeUser['.id'];
             const bytesIn = parseInt(activeUser['bytes-in'] || 0);
             const bytesOut = parseInt(activeUser['bytes-out'] || 0);
             const currentSessionBytes = bytesIn + bytesOut;
-
-            if (!username) continue;
 
             const hotspotUser = await HotspotUser.findOne({
               where: { username, companyId: company.id }
@@ -718,19 +728,18 @@ const collectActiveSessionUsage = async () => {
               continue;
             }
             
-            // ==================== INÍCIO DA CORREÇÃO ====================
-            // GARANTIR QUE OS VALORES DO BANCO SEJAM NÚMEROS ANTES DE CALCULAR
+            // ==================== INÍCIO DA CORREÇÃO DEFINITIVA ====================
+            // Força a conversão de TODOS os valores do banco para NÚMEROS antes de usar.
             const dbCreditsUsed = parseFloat(hotspotUser.creditsUsed) || 0;
+            const dbCreditsTotal = parseFloat(hotspotUser.creditsTotal) || 0;
             const dbCurrentSessionBytes = parseFloat(hotspotUser.currentSessionBytes) || 0;
-            // ===================== FIM DA CORREÇÃO ======================
+            // ===================== FIM DA CORREÇÃO DEFINITIVA ======================
 
             const incremento = currentSessionBytes - dbCurrentSessionBytes;
             
             if (incremento > 0) {
-              // ==================== INÍCIO DA CORREÇÃO ====================
-              // USAR O VALOR NUMÉRICO GARANTIDO
+              // Usa os valores numéricos garantidos para o cálculo
               const novoTotal = dbCreditsUsed + incremento;
-              // ===================== FIM DA CORREÇÃO ======================
 
               await hotspotUser.update({
                 creditsUsed: novoTotal,
@@ -739,16 +748,15 @@ const collectActiveSessionUsage = async () => {
                 lastCollectionTime: new Date()
               });
               
-              console.log(`[COLLECT] ✅ '${username}': +${Math.round(incremento/1024/1024*100)/100}MB (Total: ${Math.round(novoTotal/1024/1024*100)/100}MB/${Math.round(hotspotUser.creditsTotal/1024/1024*100)/100}MB)`);
+              console.log(`[COLLECT] ✅ '${username}': +${Math.round(incremento/1024/1024*100)/100}MB (Total: ${Math.round(novoTotal/1024/1024*100)/100}MB/${Math.round(dbCreditsTotal/1024/1024*100)/100}MB)`);
               
-              if (novoTotal >= hotspotUser.creditsTotal) {
+              if (novoTotal >= dbCreditsTotal) {
                 console.log(`[COLLECT] 🚨 '${username}' excedeu limite! Desconectando...`);
                 await disconnectAndDisableUser(hotspotUser, company, mikrotikClient);
               }
               
               totalProcessed++;
             } else {
-              // Se não houve incremento, apenas atualiza o sessionId se for novo
               if (hotspotUser.sessionId !== sessionId) {
                 await hotspotUser.update({
                   sessionId: sessionId,
@@ -776,7 +784,7 @@ const collectActiveSessionUsage = async () => {
   } catch (error) {
     console.error(`[COLLECT] ❌ Erro geral na coleta: ${error.message}`);
   }
-};
+}
 
 // ✅ FUNÇÃO ALTERNATIVA: Buscar dados específicos do usuário
 const getSpecificUserData = async (username, company) => {

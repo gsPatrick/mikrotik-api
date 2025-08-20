@@ -1,6 +1,4 @@
-// ==========================================
-// 1. CORREÇÃO DO SCHEDULER (src/scheduler/index.js)
-// ==========================================
+// src/scheduler/index.js
 
 const cron = require('node-cron');
 const { getSettings } = require('../features/settings/settings.service');
@@ -22,9 +20,12 @@ const startTask = (taskName, schedule, jobFunction) => {
   stopTask(taskName);
 
   if (cron.validate(schedule)) {
-    const task = cron.schedule(schedule, jobFunction);
+    const task = cron.schedule(schedule, jobFunction, {
+      // Adicionado para garantir que a tarefa rode no fuso horário do sistema
+      timezone: process.env.TZ || 'America/Sao_Paulo' 
+    });
     scheduledTasks[taskName] = task;
-    console.log(`[Scheduler] Tarefa '${taskName}' agendada (horário do servidor): [${schedule}]`);
+    console.log(`[Scheduler] Tarefa '${taskName}' agendada (fuso do servidor): [${schedule}]`);
   } else {
     console.error(`[Scheduler] ERRO: Expressão cron inválida para a tarefa '${taskName}': [${schedule}]`);
   }
@@ -35,8 +36,11 @@ const rescheduleAllTasks = async () => {
   try {
     const settings = await getSettings();
 
-    // Tarefa 1: Reset diário de créditos
-    const creditResetTime = settings.creditResetTimeUTC || '00:00';
+    // ===================================================================
+    // TAREFA 1: Reset Diário de Créditos (Lógica separada e correta)
+    // ===================================================================
+    // Esta tarefa continua a mesma, pois sua responsabilidade é única.
+    const creditResetTime = settings.creditResetTimeUTC || '03:00';
     const [hour, minute] = creditResetTime.split(':');
     const creditResetCron = `${minute} ${hour} * * *`;
     startTask('creditReset', creditResetCron, () => {
@@ -44,25 +48,25 @@ const rescheduleAllTasks = async () => {
         hotspotUserService.resetDailyCreditsForAllUsers();
     });
     
-    // ✅ CORREÇÃO: Usar a função corrigida do hotspotUserService
-    startTask('usageCollection', settings.usageCollectionCron, () => {
-        console.log(`[${new Date().toISOString()}] Executando job: Coleta de Uso de Sessões Ativas...`);
-        hotspotUserService.collectActiveSessionUsage();
-    });
-    
-    // ✅ NOVA TAREFA: Monitoramento de logouts
-    startTask('logoutMonitoring', '*/2 * * * *', () => { // A cada 2 minutos
-        console.log(`[${new Date().toISOString()}] Executando job: Monitoramento de Logouts...`);
-        hotspotUserService.monitorUserLogouts();
+    // ===================================================================
+    // TAREFA 2: Coleta de Uso Unificada (A GRANDE CORREÇÃO)
+    // ===================================================================
+    // Substituímos as 3 tarefas antigas por esta única chamada.
+    // Ela executa a lógica robusta do 'mikrotik.service.js'.
+    startTask('unifiedUsageCollection', settings.usageCollectionCron, () => {
+        console.log(`[${new Date().toISOString()}] Executando job: Coleta de Uso UNIFICADA para todas as empresas...`);
+        mikrotikService.collectUsageForAllCompaniesUnified();
     });
 
-    // ✅ NOVA TAREFA: Limpeza de sessões órfãs
-    startTask('sessionCleanup', '*/5 * * * *', () => { // A cada 5 minutos
-        console.log(`[${new Date().toISOString()}] Executando job: Limpeza de Sessões Órfãs...`);
-        hotspotUserService.cleanupOrphanedSessions();
-    });
+    // TAREFAS ANTIGAS E FRAGMENTADAS REMOVIDAS
+    stopTask('usageCollection');      // Remove a tarefa antiga se existir
+    stopTask('logoutMonitoring');     // Remove a tarefa antiga se existir
+    stopTask('sessionCleanup');       // Remove a tarefa antiga se existir
     
-    // Tarefa 3: Sincronização de Dados do MikroTik (mantida)
+    // ===================================================================
+    // TAREFA 3: Sincronização de Dados do MikroTik (mantida)
+    // ===================================================================
+    // Sincroniza perfis e usuários que foram criados diretamente no MikroTik.
     startTask('mikrotikDataSync', settings.mikrotikDataSyncCron, async () => {
         console.log(`[${new Date().toISOString()}] Executando job: Sincronização de Dados MikroTik...`);
         const companies = await Company.findAll({ attributes: ['id', 'name'] });

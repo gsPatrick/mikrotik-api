@@ -18,44 +18,30 @@ const collectUsageDataUnified = async (companyId) => {
   const action = 'collectUsageDataUnified';
 
   try {
-    // 1. BUSCAR DADOS DO MIKROTIK
     console.log(`[COLLECT-UNIFIED] Buscando dados do MikroTik...`);
     
-    const [activeSessionsResponse, allUsersResponse] = await Promise.all([
+    const [activeSessionsResponse] = await Promise.all([
       mikrotikClient.get('/ip/hotspot/active'),
-      mikrotikClient.get('/ip/hotspot/user')
     ]);
     
     const activeSessions = Array.isArray(activeSessionsResponse.data) ? activeSessionsResponse.data : [];
-    const allMikrotikUsers = Array.isArray(allUsersResponse.data) ? allUsersResponse.data : [];
-    
-    console.log(`[COLLECT-UNIFIED] ${activeSessions.length} sessões ativas, ${allMikrotikUsers.length} usuários cadastrados`);
+    console.log(`[COLLECT-UNIFIED] ${activeSessions.length} sessões ativas`);
 
-    // 2. MAPEAR SESSÕES ATIVAS
     const activeSessionsMap = new Map();
     activeSessions.forEach(session => {
-      if (session.user || session.name) {
-        const username = session.user || session.name;
-        const bytesIn = parseInt(session['bytes-in'] || session.bytesIn || 0);
-        const bytesOut = parseInt(session['bytes-out'] || session.bytesOut || 0);
+      const username = session.user || session.name;
+      if (username) {
+        const bytesIn = parseInt(session['bytes-in'] || 0);
+        const bytesOut = parseInt(session['bytes-out'] || 0);
         
         activeSessionsMap.set(username, {
-          sessionId: session['.id'] || session.id,
-          bytesIn,
-          bytesOut,
+          sessionId: session['.id'],
           totalSessionBytes: bytesIn + bytesOut,
-          address: session.address,
-          macAddress: session['mac-address'] || session.mac,
-          uptime: session.uptime
         });
       }
     });
 
-    // 3. PROCESSAR USUÁRIOS DO BANCO
-    const dbUsers = await HotspotUser.findAll({
-      where: { companyId },
-      include: [{ model: Company, as: 'company' }]
-    });
+    const dbUsers = await HotspotUser.findAll({ where: { companyId } });
 
     let updatedCount = 0;
     let expiredCount = 0;
@@ -66,123 +52,79 @@ const collectUsageDataUnified = async (companyId) => {
     for (const dbUser of dbUsers) {
       try {
         const activeSession = activeSessionsMap.get(dbUser.username);
-        const previousSessionBytes = dbUser.currentSessionBytes || 0;
+
+        // ==================== INÍCIO DA CORREÇÃO DEFINITIVA ====================
+        // Força a conversão de TODOS os valores do banco para NÚMEROS antes de usar.
+        const dbCreditsUsed = parseFloat(dbUser.creditsUsed) || 0;
+        const dbCreditsTotal = parseFloat(dbUser.creditsTotal) || 0;
+        const dbCurrentSessionBytes = parseFloat(dbUser.currentSessionBytes) || 0;
+        // ===================== FIM DA CORREÇÃO DEFINITIVA ======================
         
         if (activeSession) {
-          // ✅ USUÁRIO ESTÁ ATIVO - CALCULAR INCREMENTO
           const currentSessionBytes = activeSession.totalSessionBytes;
-          const incremento = currentSessionBytes - previousSessionBytes;
+          const incremento = currentSessionBytes - dbCurrentSessionBytes;
           
-          // Só processar se houve incremento de consumo
           if (incremento > 0) {
-            const newCreditsUsed = dbUser.creditsUsed + incremento;
+            // Usa os valores numéricos garantidos para o cálculo
+            const newCreditsUsed = dbCreditsUsed + incremento;
+            const willExceedLimit = newCreditsUsed >= dbCreditsTotal && dbCreditsTotal > 0;
             
-            // VERIFICAR PERÍODO DE CARÊNCIA
-            const isInGracePeriod = dbUser.lastResetDate && 
-              ((new Date() - dbUser.lastResetDate) / (1000 * 60)) < 5;
-            
-            if (isInGracePeriod) {
-              console.log(`[GRACE] '${dbUser.username}' em período de carência (${Math.round(((new Date() - dbUser.lastResetDate) / (1000 * 60)) * 10) / 10} min)`);
+            if (willExceedLimit && dbUser.status === 'active') {
+              console.log(`[LIMIT] '${dbUser.username}' excedeu limite: ${Math.round(newCreditsUsed/1024/1024)}MB/${Math.round(dbCreditsTotal/1024/1024)}MB`);
+              await disconnectAndDisableUserUnified(dbUser, activeSession, mikrotikClient, company);
+              expiredCount++;
               
-              // Apenas atualizar bytes, não verificar limite
+              await dbUser.update({
+                creditsUsed: newCreditsUsed,
+                currentSessionBytes: 0,
+                sessionId: null,
+                status: 'expired',
+                lastCollectionTime: new Date()
+              });
+            } else {
               await dbUser.update({
                 creditsUsed: newCreditsUsed,
                 currentSessionBytes: currentSessionBytes,
                 sessionId: activeSession.sessionId,
                 lastCollectionTime: new Date()
               });
-              
-            } else {
-              // VERIFICAR LIMITE DE CRÉDITO
-              const willExceedLimit = newCreditsUsed >= dbUser.creditsTotal && dbUser.creditsTotal > 0;
-              
-              if (willExceedLimit && dbUser.status === 'active') {
-                console.log(`[LIMIT] '${dbUser.username}' excedeu limite: ${Math.round(newCreditsUsed/1024/1024)}MB/${Math.round(dbUser.creditsTotal/1024/1024)}MB`);
-                
-                // DESCONECTAR E DESATIVAR
-                await disconnectAndDisableUserUnified(dbUser, activeSession, mikrotikClient, company);
-                expiredCount++;
-                
-                await dbUser.update({
-                  creditsUsed: newCreditsUsed,
-                  currentSessionBytes: 0, // Reset pois foi desconectado
-                  sessionId: null,
-                  status: 'expired',
-                  lastCollectionTime: new Date()
-                });
-                
-              } else {
-                // ATUALIZAÇÃO NORMAL
-                await dbUser.update({
-                  creditsUsed: newCreditsUsed,
-                  currentSessionBytes: currentSessionBytes,
-                  sessionId: activeSession.sessionId,
-                  lastCollectionTime: new Date()
-                });
-              }
             }
             
             console.log(`[COLLECT] '${dbUser.username}': +${Math.round(incremento/1024/1024*100)/100}MB (Total: ${Math.round(newCreditsUsed/1024/1024*100)/100}MB)`);
             updatedCount++;
-            
-          } else if (incremento < 0) {
-            // NOVA SESSÃO DETECTADA (contadores resetaram)
-            console.log(`[NEW-SESSION] '${dbUser.username}': Nova sessão iniciada`);
-            
-            await dbUser.update({
-              currentSessionBytes: currentSessionBytes,
-              sessionId: activeSession.sessionId,
-              lastCollectionTime: new Date()
-            });
           } else {
-            // SEM INCREMENTO - apenas atualizar timestamp
-            await dbUser.update({
-              sessionId: activeSession.sessionId,
-              lastCollectionTime: new Date()
-            });
+            if (dbUser.sessionId !== activeSession.sessionId) {
+              await dbUser.update({
+                sessionId: activeSession.sessionId,
+                lastCollectionTime: new Date()
+              });
+            }
           }
-          
         } else {
-          // ✅ USUÁRIO NÃO ESTÁ ATIVO - LIMPAR SESSÃO SE NECESSÁRIO
           if (dbUser.sessionId) {
             console.log(`[LOGOUT] '${dbUser.username}': Logout detectado`);
-            
-            // Se havia bytes de sessão pendentes, acumular
-            if (previousSessionBytes > 0) {
-              const finalCreditsUsed = dbUser.creditsUsed + previousSessionBytes;
-              
+            if (dbCurrentSessionBytes > 0) {
+              const finalCreditsUsed = dbCreditsUsed + dbCurrentSessionBytes;
               await dbUser.update({
                 creditsUsed: finalCreditsUsed,
                 currentSessionBytes: 0,
                 sessionId: null,
                 lastLogoutTime: new Date()
               });
-              
-              console.log(`[LOGOUT] '${dbUser.username}': +${Math.round(previousSessionBytes/1024/1024*100)/100}MB final (Total: ${Math.round(finalCreditsUsed/1024/1024*100)/100}MB)`);
-              
-              // Verificar se excedeu após logout
-              if (finalCreditsUsed >= dbUser.creditsTotal && dbUser.creditsTotal > 0 && dbUser.status === 'active') {
+              if (finalCreditsUsed >= dbCreditsTotal && dbCreditsTotal > 0 && dbUser.status === 'active') {
                 await dbUser.update({ status: 'expired' });
-                console.log(`[LOGOUT] '${dbUser.username}': Marcado como expirado após logout`);
               }
-              
             } else {
-              // Logout sem bytes pendentes
-              await dbUser.update({
-                sessionId: null,
-                lastLogoutTime: new Date()
-              });
+              await dbUser.update({ sessionId: null, lastLogoutTime: new Date() });
             }
           }
         }
-        
       } catch (userError) {
         console.error(`[COLLECT] ❌ Erro ao processar '${dbUser.username}': ${userError.message}`);
         errors++;
       }
     }
 
-    // 4. LOG DE RESULTADO
     await ConnectionLog.create({
       action,
       status: 'success',
@@ -192,27 +134,12 @@ const collectUsageDataUnified = async (companyId) => {
     });
 
     console.log(`[COLLECT-UNIFIED] ✅ Finalizado: ${updatedCount} atualizados, ${expiredCount} expirados, ${errors} erros`);
-
-    return {
-      syncedUsersInDB: updatedCount,
-      expiredUsers: expiredCount,
-      errors,
-      activeSessions: activeSessions.length,
-      totalUsers: dbUsers.length
-    };
+    return { updatedCount, expiredCount, errors };
 
   } catch (error) {
     const errorMessage = error.response?.data?.message || error.message;
     console.error(`[COLLECT-UNIFIED] ❌ Erro geral: ${errorMessage}`);
-    
-    await ConnectionLog.create({
-      action,
-      status: 'error',
-      message: errorMessage,
-      responseTime: Date.now() - startTime,
-      companyId
-    });
-    
+    await ConnectionLog.create({ action, status: 'error', message: errorMessage, responseTime: Date.now() - startTime, companyId });
     throw error;
   }
 };
@@ -530,34 +457,54 @@ const importUsersFromMikrotik = async (companyId) => {
     }
 
     let hashedPasswordForNewUser = undefined;
-    if (mikrotikUser.password) {
-      const salt = await bcrypt.genSalt(10);
-      hashedPasswordForNewUser = await bcrypt.hash(mikrotikUser.password, salt);
-    } else {
+    if (!existingUser) { // Só gera hash para novos usuários
+        const passwordToHash = mikrotikUser.password || 'imported_user';
         const salt = await bcrypt.genSalt(10);
-        hashedPasswordForNewUser = await bcrypt.hash('imported_user', salt);
+        hashedPasswordForNewUser = await bcrypt.hash(passwordToHash, salt);
+    }
+    
+    // ==================== INÍCIO DA NOVA LÓGICA DE SINCRONIZAÇÃO ====================
+    
+    // 1. Calcular o consumo total do usuário no MikroTik
+    const bytesIn = parseFloat(mikrotikUser['bytes-in'] || 0);
+    const bytesOut = parseFloat(mikrotikUser['bytes-out'] || 0);
+    const totalBytesUsed = bytesIn + bytesOut;
+
+    // 2. Determinar o status com base no consumo e no campo 'disabled'
+    let finalStatus;
+    if (totalBytesUsed >= defaultDailyCreditBytes && defaultDailyCreditBytes > 0) {
+        // Se o consumo já excedeu o limite padrão, o status é 'expired'
+        finalStatus = 'expired';
+        console.log(`[Sync] Usuário '${mikrotikUser.name}' importado como 'expired' pois o consumo (${Math.round(totalBytesUsed/1024/1024)}MB) excede o limite (${settings?.defaultDailyCreditMB}MB).`);
+    } else if (mikrotikUser.disabled === 'true') {
+        // Se não excedeu, mas está desabilitado no MikroTik
+        finalStatus = 'inactive';
+    } else {
+        // Caso contrário, está ativo
+        finalStatus = 'active';
     }
 
-    let statusFromMikrotik = 'active';
-    if (mikrotikUser.disabled === 'true') {
-        statusFromMikrotik = 'inactive';
-    }
-
-      const userDataToSync = {
+    const userDataToSync = {
         username: mikrotikUser.name,
-        password: hashedPasswordForNewUser, 
         mikrotikId: mikrotikUser['.id'],
-        turma: !existingUser ? 'A' : (existingUser.turma || 'A'),
+        turma: !existingUser ? 'A' : (existingUser.turma || 'A'), // Mantém a turma se já existir
         companyId: companyId,
         profileId: profileId,
-        status: statusFromMikrotik,
-        creditsTotal: defaultDailyCreditBytes, 
+        status: finalStatus, // Usa o status calculado
+        creditsUsed: totalBytesUsed, // Salva o consumo atual
+        creditsTotal: defaultDailyCreditBytes,
     };
+
+    if (hashedPasswordForNewUser) {
+        userDataToSync.password = hashedPasswordForNewUser;
+    }
+    
+    // ===================== FIM DA NOVA LÓGICA DE SINCRONIZAÇÃO ======================
 
     if (!existingUser) {
       await HotspotUser.create(userDataToSync);
       importedCount++;
-      writeSyncLog(`[Usuários][${company.name}] CRIADO: ${mikrotikUser.name}. Mikrotik ID: ${mikrotikUser['.id']}. Turma atribuída: 'A'. Status: ${statusFromMikrotik}.`);
+      writeSyncLog(`[Usuários][${company.name}] CRIADO: ${mikrotikUser.name}. Status: ${finalStatus}. Consumo: ${Math.round(totalBytesUsed/1024/1024)}MB.`);
     } else {
       let changed = false;
       const updates = {};
@@ -566,21 +513,18 @@ const importUsersFromMikrotik = async (companyId) => {
           updates.username = userDataToSync.username;
           changed = true;
       }
-      
       if (existingUser.profileId !== userDataToSync.profileId) {
           updates.profileId = userDataToSync.profileId;
           changed = true;
       }
-      
+      // Sempre atualiza o status e o consumo para refletir o estado real do MikroTik
       if (existingUser.status !== userDataToSync.status) {
-          if (userDataToSync.status === 'inactive') {
-              updates.status = 'inactive';
-              changed = true;
-          } 
-          else if (userDataToSync.status === 'active' && existingUser.status !== 'expired') {
-              updates.status = 'active';
-              changed = true;
-          }
+          updates.status = userDataToSync.status;
+          changed = true;
+      }
+      if (parseFloat(existingUser.creditsUsed) !== userDataToSync.creditsUsed) {
+          updates.creditsUsed = userDataToSync.creditsUsed;
+          changed = true;
       }
       
       if (changed) {
@@ -596,7 +540,6 @@ const importUsersFromMikrotik = async (companyId) => {
   
   return { importedCount, updatedCount, skippedCount, totalInMikrotik: mikrotikUsers.length };
 };
-
 const findAllLogs = async (options) => {
   const { page = 1, limit = 10, sortBy = 'createdAt', sortOrder = 'DESC', ...filters } = options;
   const where = {};
