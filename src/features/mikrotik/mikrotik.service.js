@@ -172,7 +172,7 @@ const disconnectAndDisableUserUnified = async (dbUser, activeSession, mikrotikCl
       try {
         await mikrotikClient.post('/ip/hotspot/user/set', {
           '.id': dbUser.mikrotikId,
-          disabled: 'true'
+          disabled: 'yes'
         }, {
           headers: { 'Content-Type': 'application/json' }
         });
@@ -620,7 +620,7 @@ const disconnectAndDisableUserWithRetry = async (dbUser, activeSession, mikrotik
       if (dbUser.mikrotikId) {
         await mikrotikClient.post('/ip/hotspot/user/set', {
           '.id': dbUser.mikrotikId,
-          disabled: 'true'
+          disabled: 'yes'
         }, {
           headers: { 'Content-Type': 'application/json' },
           timeout: 5000
@@ -730,7 +730,7 @@ const expireUserInMikroTik = async (dbUser, mikrotikClient, company) => {
     if (dbUser.mikrotikId) {
       await mikrotikClient.post('/ip/hotspot/user/set', {
         '.id': dbUser.mikrotikId,
-        disabled: 'true'
+        disabled: 'yes'
       }, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 5000
@@ -804,7 +804,7 @@ const auditExpiredUsers = async () => {
               
               await mikrotikClient.post('/ip/hotspot/user/set', {
                 '.id': user.mikrotikId,
-                disabled: 'true'
+                disabled: 'yes'
               }, {
                 headers: { 'Content-Type': 'application/json' }
               });

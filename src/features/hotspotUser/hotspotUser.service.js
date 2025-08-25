@@ -314,7 +314,7 @@ const updateCredits = async (userId, creditData, performingUser) => {
         
       } catch (resetError) {
         console.log(`[RESET] ⚠️ Erro no reset de contadores: ${resetError.message}. Tentando método alternativo...`);
-        const disablePayload = { '.id': hotspotUser.mikrotikId, disabled: 'true' };
+        const disablePayload = { '.id': hotspotUser.mikrotikId, disabled: 'yes' };
         await mikrotikClient.post('/ip/hotspot/user/set', disablePayload, { headers: { 'Content-Type': 'application/json' } });
         await new Promise(resolve => setTimeout(resolve, 500));
         const enablePayload = { '.id': hotspotUser.mikrotikId, disabled: 'false' };
@@ -1019,7 +1019,7 @@ const captureUserLogout = async (hotspotUser, company) => {
           try {
             const disablePayload = {
               '.id': hotspotUser.mikrotikId,
-              disabled: 'true'
+              disabled: 'yes'
             };
             
             await mikrotikClient.post('/ip/hotspot/user/set', disablePayload, {
@@ -1088,7 +1088,7 @@ const disconnectAndDisableUser = async (hotspotUser, company, mikrotikClient) =>
       try {
         const disablePayload = {
           '.id': hotspotUser.mikrotikId,
-          disabled: 'true'
+          disabled: 'yes'
         };
         
         await mikrotikClient.post('/ip/hotspot/user/set', disablePayload, {
@@ -1217,7 +1217,7 @@ const auditAndFixExpiredUsers = async (companyId = null) => {
                   try {
                     await mikrotikClient.post('/ip/hotspot/user/set', {
                       '.id': user.mikrotikId,
-                      disabled: 'true'
+                      disabled: 'yes'
                     }, {
                       headers: { 'Content-Type': 'application/json' }
                     });

@@ -262,7 +262,7 @@ const syncHotspotUserStatusByTurma = async (companyId, activeTurma) => {
                     // CORREÇÃO: Usar POST com /set
                     await mikrotikClient.post('/ip/hotspot/user/set', {
                         '.id': user.mikrotikId,
-                        disabled: 'true'
+                        disabled: 'yes'
                     }, {
                         headers: {
                             'Content-Type': 'application/json'
