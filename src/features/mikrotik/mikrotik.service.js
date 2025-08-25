@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const { writeSyncLog } = require('../../services/syncLog.service');
 
 // ✅ FUNÇÃO PRINCIPAL UNIFICADA: Coleta de uso em tempo real
+// Substitua a função collectUsageDataUnified no arquivo mikrotik.service.js
 const collectUsageDataUnified = async (companyId) => {
   console.log(`[COLLECT-UNIFIED] Iniciando coleta para empresa ID: ${companyId}`);
   
@@ -53,25 +54,24 @@ const collectUsageDataUnified = async (companyId) => {
       try {
         const activeSession = activeSessionsMap.get(dbUser.username);
 
-        // ==================== INÍCIO DA CORREÇÃO DEFINITIVA ====================
-        // Força a conversão de TODOS os valores do banco para NÚMEROS antes de usar.
+        // Força a conversão de TODOS os valores do banco para NÚMEROS
         const dbCreditsUsed = parseFloat(dbUser.creditsUsed) || 0;
         const dbCreditsTotal = parseFloat(dbUser.creditsTotal) || 0;
         const dbCurrentSessionBytes = parseFloat(dbUser.currentSessionBytes) || 0;
-        // ===================== FIM DA CORREÇÃO DEFINITIVA ======================
         
         if (activeSession) {
           const currentSessionBytes = activeSession.totalSessionBytes;
           const incremento = currentSessionBytes - dbCurrentSessionBytes;
           
           if (incremento > 0) {
-            // Usa os valores numéricos garantidos para o cálculo
             const newCreditsUsed = dbCreditsUsed + incremento;
             const willExceedLimit = newCreditsUsed >= dbCreditsTotal && dbCreditsTotal > 0;
             
             if (willExceedLimit && dbUser.status === 'active') {
               console.log(`[LIMIT] '${dbUser.username}' excedeu limite: ${Math.round(newCreditsUsed/1024/1024)}MB/${Math.round(dbCreditsTotal/1024/1024)}MB`);
-              await disconnectAndDisableUserUnified(dbUser, activeSession, mikrotikClient, company);
+              
+              // ✅ CORREÇÃO PRINCIPAL: Usar função específica para desconexão e desativação
+              await disconnectAndDisableUserWithRetry(dbUser, activeSession, mikrotikClient, company);
               expiredCount++;
               
               await dbUser.update({
@@ -111,7 +111,11 @@ const collectUsageDataUnified = async (companyId) => {
                 sessionId: null,
                 lastLogoutTime: new Date()
               });
+              
+              // ✅ VERIFICAR SE EXPIROU APÓS LOGOUT
               if (finalCreditsUsed >= dbCreditsTotal && dbCreditsTotal > 0 && dbUser.status === 'active') {
+                console.log(`[LOGOUT-EXPIRED] '${dbUser.username}' expirou após logout`);
+                await expireUserInMikroTik(dbUser, mikrotikClient, company);
                 await dbUser.update({ status: 'expired' });
               }
             } else {
@@ -580,6 +584,257 @@ const findNetworkNeighbors = async (companyId) => {
   }
 };
 
+// ====================================================================
+// NOVA FUNÇÃO: Desconectar e Desativar com Retry e Validação
+// ====================================================================
+
+const disconnectAndDisableUserWithRetry = async (dbUser, activeSession, mikrotikClient, company, maxRetries = 3) => {
+  console.log(`[DISCONNECT-WITH-RETRY] Processando '${dbUser.username}' com ${maxRetries} tentativas...`);
+  
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[DISCONNECT-WITH-RETRY] Tentativa ${attempt}/${maxRetries} para '${dbUser.username}'`);
+      
+      // 1. DESCONECTAR SESSÃO ATIVA PRIMEIRO
+      if (activeSession && activeSession.sessionId) {
+        try {
+          await mikrotikClient.post('/ip/hotspot/active/remove', {
+            '.id': activeSession.sessionId
+          }, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 5000 // 5 segundos de timeout
+          });
+          console.log(`[DISCONNECT-WITH-RETRY] ✅ Sessão ${activeSession.sessionId} desconectada (tentativa ${attempt})`);
+        } catch (sessionError) {
+          console.warn(`[DISCONNECT-WITH-RETRY] ⚠️ Erro ao desconectar sessão (tentativa ${attempt}): ${sessionError.message}`);
+          // Continua para tentar desativar o usuário mesmo se a desconexão falhar
+        }
+      }
+
+      // 2. AGUARDAR UM POUCO ENTRE DESCONEXÃO E DESATIVAÇÃO
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // 3. DESATIVAR USUÁRIO NO MIKROTIK
+      if (dbUser.mikrotikId) {
+        await mikrotikClient.post('/ip/hotspot/user/set', {
+          '.id': dbUser.mikrotikId,
+          disabled: 'true'
+        }, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5000
+        });
+        console.log(`[DISCONNECT-WITH-RETRY] ✅ Usuário '${dbUser.username}' desativado no MikroTik (tentativa ${attempt})`);
+      }
+
+      // 4. VERIFICAR SE REALMENTE FOI DESATIVADO
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const verificationResult = await verifyUserDisabled(dbUser.mikrotikId, mikrotikClient);
+      
+      if (verificationResult.disabled) {
+        console.log(`[DISCONNECT-WITH-RETRY] ✅ Verificação confirmada: '${dbUser.username}' está desativado`);
+        
+        // 5. ENVIAR EMAIL DE NOTIFICAÇÃO
+        try {
+          await sendCreditExhaustedEmail(dbUser, company);
+          console.log(`[DISCONNECT-WITH-RETRY] ✅ Email enviado para '${dbUser.username}'`);
+        } catch (emailError) {
+          console.warn(`[DISCONNECT-WITH-RETRY] ⚠️ Erro ao enviar email: ${emailError.message}`);
+        }
+
+        // 6. REGISTRAR LOG DE SUCESSO
+        await ConnectionLog.create({
+          action: 'disconnectAndDisableUserWithRetry',
+          status: 'success',
+          message: `Usuário '${dbUser.username}' desconectado e desativado com sucesso após ${attempt} tentativa(s). Crédito: ${Math.round(dbUser.creditsTotal/1024/1024)}MB`,
+          responseTime: 0,
+          companyId: company.id
+        });
+
+        return true; // Sucesso
+      } else {
+        throw new Error(`Verificação falhou: usuário ainda aparece como ativo no MikroTik`);
+      }
+
+    } catch (error) {
+      lastError = error;
+      console.error(`[DISCONNECT-WITH-RETRY] ❌ Tentativa ${attempt} falhou: ${error.message}`);
+      
+      if (attempt < maxRetries) {
+        const delay = attempt * 2000; // Delay progressivo: 2s, 4s, 6s
+        console.log(`[DISCONNECT-WITH-RETRY] Aguardando ${delay}ms antes da próxima tentativa...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  // Se chegou aqui, todas as tentativas falharam
+  console.error(`[DISCONNECT-WITH-RETRY] ❌ FALHA TOTAL após ${maxRetries} tentativas para '${dbUser.username}'`);
+  
+  await ConnectionLog.create({
+    action: 'disconnectAndDisableUserWithRetry',
+    status: 'error',
+    message: `FALHA ao processar '${dbUser.username}' após ${maxRetries} tentativas. Último erro: ${lastError?.message}`,
+    responseTime: 0,
+    companyId: company.id
+  });
+
+  // Mesmo com falha, marcar como expirado no sistema local
+  await dbUser.update({ status: 'expired' });
+  
+  return false; // Falha
+};
+
+
+// ====================================================================
+// NOVA FUNÇÃO: Verificar se Usuário Foi Realmente Desativado
+// ====================================================================
+
+const verifyUserDisabled = async (mikrotikId, mikrotikClient) => {
+  try {
+    const response = await mikrotikClient.get('/ip/hotspot/user', {
+      params: {
+        '.proplist': '.id,name,disabled',
+        '?.id': mikrotikId
+      }
+    });
+    
+    const users = response.data || [];
+    const user = users.find(u => u['.id'] === mikrotikId);
+    
+    if (user) {
+      return {
+        found: true,
+        disabled: user.disabled === 'true',
+        name: user.name
+      };
+    }
+    
+    return { found: false, disabled: false };
+    
+  } catch (error) {
+    console.error(`[VERIFY] Erro ao verificar usuário: ${error.message}`);
+    return { found: false, disabled: false, error: error.message };
+  }
+};
+
+// ====================================================================
+// NOVA FUNÇÃO: Expirar Usuário Apenas (sem desconectar sessão)
+// ====================================================================
+
+const expireUserInMikroTik = async (dbUser, mikrotikClient, company) => {
+  try {
+    console.log(`[EXPIRE] Desativando usuário '${dbUser.username}' no MikroTik...`);
+    
+    if (dbUser.mikrotikId) {
+      await mikrotikClient.post('/ip/hotspot/user/set', {
+        '.id': dbUser.mikrotikId,
+        disabled: 'true'
+      }, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 5000
+      });
+      
+      // Verificar se foi desativado
+      const verification = await verifyUserDisabled(dbUser.mikrotikId, mikrotikClient);
+      if (verification.disabled) {
+        console.log(`[EXPIRE] ✅ Usuário '${dbUser.username}' desativado com sucesso`);
+        
+        // Enviar email
+        try {
+          await sendCreditExhaustedEmail(dbUser, company);
+        } catch (emailError) {
+          console.warn(`[EXPIRE] ⚠️ Erro ao enviar email: ${emailError.message}`);
+        }
+        
+        return true;
+      } else {
+        throw new Error('Verificação falhou após desativação');
+      }
+    }
+    
+  } catch (error) {
+    console.error(`[EXPIRE] ❌ Erro ao expirar usuário '${dbUser.username}': ${error.message}`);
+    
+    await ConnectionLog.create({
+      action: 'expireUserInMikroTik',
+      status: 'error',
+      message: `Falha ao expirar usuário '${dbUser.username}': ${error.message}`,
+      companyId: company.id
+    });
+    
+    return false;
+  }
+};
+
+// ====================================================================
+// NOVA FUNÇÃO: Job para Verificar e Corrigir Usuários Expirados
+// ====================================================================
+
+const auditExpiredUsers = async () => {
+  console.log('[AUDIT] Iniciando auditoria de usuários expirados...');
+  
+  try {
+    const companies = await Company.findAll();
+    let totalFixed = 0;
+    
+    for (const company of companies) {
+      try {
+        console.log(`[AUDIT] Auditando empresa: ${company.name}`);
+        
+        const mikrotikClient = createMikrotikClient(company);
+        
+        // Buscar usuários marcados como expirados no sistema
+        const expiredUsers = await HotspotUser.findAll({
+          where: {
+            companyId: company.id,
+            status: 'expired'
+          }
+        });
+        
+        console.log(`[AUDIT] ${expiredUsers.length} usuários expirados encontrados em '${company.name}'`);
+        
+        for (const user of expiredUsers) {
+          if (user.mikrotikId) {
+            const verification = await verifyUserDisabled(user.mikrotikId, mikrotikClient);
+            
+            if (verification.found && !verification.disabled) {
+              console.log(`[AUDIT] 🔧 Corrigindo usuário '${user.username}' - estava expirado mas ativo no MikroTik`);
+              
+              await mikrotikClient.post('/ip/hotspot/user/set', {
+                '.id': user.mikrotikId,
+                disabled: 'true'
+              }, {
+                headers: { 'Content-Type': 'application/json' }
+              });
+              
+              totalFixed++;
+              
+              await ConnectionLog.create({
+                action: 'auditExpiredUsers',
+                status: 'success',
+                message: `Usuário '${user.username}' corrigido: estava expirado no sistema mas ativo no MikroTik`,
+                companyId: company.id
+              });
+            }
+          }
+        }
+        
+      } catch (companyError) {
+        console.error(`[AUDIT] ❌ Erro na empresa '${company.name}': ${companyError.message}`);
+      }
+    }
+    
+    console.log(`[AUDIT] ✅ Auditoria finalizada: ${totalFixed} usuários corrigidos`);
+    return { success: true, totalFixed };
+    
+  } catch (error) {
+    console.error(`[AUDIT] ❌ Erro geral na auditoria: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+};
+
 module.exports = {
   // ✅ FUNÇÕES UNIFICADAS PRINCIPAIS
   collectUsageDataUnified,
@@ -601,5 +856,7 @@ module.exports = {
   // ✅ UTILITÁRIOS
   convertMikrotikTimeToMinutes,
   convertMikrotikRateToString,
-  parseTurmaComment
+  parseTurmaComment,
+
+  auditExpiredUsers
 };

@@ -699,6 +699,7 @@ const collectActiveSessionUsage = async () => {
     const companies = await Company.findAll();
     let totalProcessed = 0;
     let totalErrors = 0;
+    let totalExpired = 0;
     
     for (const company of companies) {
       const mikrotikClient = createMikrotikClient(company);
@@ -728,17 +729,14 @@ const collectActiveSessionUsage = async () => {
               continue;
             }
             
-            // ==================== INÍCIO DA CORREÇÃO DEFINITIVA ====================
-            // Força a conversão de TODOS os valores do banco para NÚMEROS antes de usar.
+            // Força a conversão de TODOS os valores do banco para NÚMEROS
             const dbCreditsUsed = parseFloat(hotspotUser.creditsUsed) || 0;
             const dbCreditsTotal = parseFloat(hotspotUser.creditsTotal) || 0;
             const dbCurrentSessionBytes = parseFloat(hotspotUser.currentSessionBytes) || 0;
-            // ===================== FIM DA CORREÇÃO DEFINITIVA ======================
 
             const incremento = currentSessionBytes - dbCurrentSessionBytes;
             
             if (incremento > 0) {
-              // Usa os valores numéricos garantidos para o cálculo
               const novoTotal = dbCreditsUsed + incremento;
 
               await hotspotUser.update({
@@ -750,13 +748,32 @@ const collectActiveSessionUsage = async () => {
               
               console.log(`[COLLECT] ✅ '${username}': +${Math.round(incremento/1024/1024*100)/100}MB (Total: ${Math.round(novoTotal/1024/1024*100)/100}MB/${Math.round(dbCreditsTotal/1024/1024*100)/100}MB)`);
               
-              if (novoTotal >= dbCreditsTotal) {
-                console.log(`[COLLECT] 🚨 '${username}' excedeu limite! Desconectando...`);
-                await disconnectAndDisableUser(hotspotUser, company, mikrotikClient);
+              // ✅ VERIFICAÇÃO CRÍTICA: Se excedeu o limite
+              if (novoTotal >= dbCreditsTotal && dbCreditsTotal > 0) {
+                console.log(`[COLLECT] 🚨 '${username}' excedeu limite! Iniciando processo de desconexão...`);
+                
+                try {
+                  // Usar a função corrigida de desconexão
+                  const disconnectSuccess = await disconnectAndDisableUser(hotspotUser, company, mikrotikClient);
+                  
+                  if (disconnectSuccess) {
+                    console.log(`[COLLECT] ✅ '${username}' desconectado e desabilitado com sucesso`);
+                    totalExpired++;
+                  } else {
+                    console.warn(`[COLLECT] ⚠️ '${username}' marcado como expirado, mas pode não ter sido desabilitado no MikroTik`);
+                  }
+                  
+                } catch (disconnectError) {
+                  console.error(`[COLLECT] ❌ Erro ao desconectar '${username}': ${disconnectError.message}`);
+                  
+                  // Mesmo com erro, marcar como expirado no sistema
+                  await hotspotUser.update({ status: 'expired' });
+                }
               }
               
               totalProcessed++;
             } else {
+              // Apenas atualizar sessionId se mudou
               if (hotspotUser.sessionId !== sessionId) {
                 await hotspotUser.update({
                   sessionId: sessionId,
@@ -777,14 +794,17 @@ const collectActiveSessionUsage = async () => {
       }
     }
     
-    if (totalProcessed > 0 || totalErrors > 0) {
-      console.log(`[COLLECT] Finalizado - Processados: ${totalProcessed}, Erros: ${totalErrors}`);
+    if (totalProcessed > 0 || totalErrors > 0 || totalExpired > 0) {
+      console.log(`[COLLECT] Finalizado - Processados: ${totalProcessed}, Expirados: ${totalExpired}, Erros: ${totalErrors}`);
     }
+    
+    return { totalProcessed, totalExpired, totalErrors };
     
   } catch (error) {
     console.error(`[COLLECT] ❌ Erro geral na coleta: ${error.message}`);
+    return { totalProcessed: 0, totalExpired: 0, totalErrors: 1 };
   }
-}
+};
 
 // ✅ FUNÇÃO ALTERNATIVA: Buscar dados específicos do usuário
 const getSpecificUserData = async (username, company) => {
@@ -1042,7 +1062,7 @@ const disconnectAndDisableUser = async (hotspotUser, company, mikrotikClient) =>
   try {
     console.log(`[DISCONNECT] Processando usuário '${hotspotUser.username}' que excedeu limite...`);
     
-    // ✅ CORREÇÃO: Desconectar usuário ativo usando POST com /remove seguindo padrão dos outros arquivos
+    // 1. DESCONECTAR SESSÃO ATIVA SE EXISTIR
     if (hotspotUser.sessionId) {
       try {
         const removePayload = {
@@ -1050,17 +1070,20 @@ const disconnectAndDisableUser = async (hotspotUser, company, mikrotikClient) =>
         };
         
         await mikrotikClient.post('/ip/hotspot/active/remove', removePayload, {
-          headers: {
-            'Content-Type': 'application/json'
-          }
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5000
         });
         console.log(`[DISCONNECT] ✅ '${hotspotUser.username}' desconectado da sessão ativa`);
       } catch (disconnectError) {
         console.error(`[DISCONNECT] ⚠️ Erro ao desconectar sessão: ${disconnectError.message}`);
+        // Continua mesmo se a desconexão falhar
       }
     }
     
-    // ✅ CORREÇÃO: Desabilitar usuário usando POST com /set seguindo padrão dos outros arquivos
+    // 2. AGUARDAR UM POUCO ENTRE DESCONEXÃO E DESATIVAÇÃO
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // 3. DESABILITAR USUÁRIO NO MIKROTIK (MAIS IMPORTANTE)
     if (hotspotUser.mikrotikId) {
       try {
         const disablePayload = {
@@ -1069,24 +1092,34 @@ const disconnectAndDisableUser = async (hotspotUser, company, mikrotikClient) =>
         };
         
         await mikrotikClient.post('/ip/hotspot/user/set', disablePayload, {
-          headers: {
-            'Content-Type': 'application/json'
-          }
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5000
         });
         console.log(`[DISCONNECT] ✅ '${hotspotUser.username}' desabilitado no MikroTik`);
+        
+        // 4. VERIFICAR SE REALMENTE FOI DESABILITADO
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const verification = await verifyUserStatusInMikroTik(hotspotUser.mikrotikId, mikrotikClient);
+        
+        if (!verification.disabled) {
+          console.warn(`[DISCONNECT] ⚠️ ATENÇÃO: '${hotspotUser.username}' pode não ter sido desabilitado corretamente`);
+        }
+        
       } catch (disableError) {
-        console.error(`[DISCONNECT] ⚠️ Erro ao desabilitar usuário: ${disableError.message}`);
+        console.error(`[DISCONNECT] ❌ Erro ao desabilitar usuário: ${disableError.message}`);
+        throw disableError; // Re-throw para que seja tratado pelo chamador
       }
     }
     
-    // Atualizar status no banco
+    // 5. ATUALIZAR STATUS NO BANCO LOCAL
     await hotspotUser.update({ 
       status: 'expired',
       currentSessionBytes: 0,
-      sessionId: null
+      sessionId: null,
+      lastExpiredTime: new Date()
     });
     
-    // Enviar email (se configurado)
+    // 6. ENVIAR EMAIL (se configurado)
     try {
       await sendCreditExhaustedEmail(hotspotUser, company);
       console.log(`[DISCONNECT] ✅ Email de limite excedido enviado para '${hotspotUser.username}'`);
@@ -1094,7 +1127,7 @@ const disconnectAndDisableUser = async (hotspotUser, company, mikrotikClient) =>
       console.error(`[DISCONNECT] ⚠️ Erro ao enviar email: ${emailError.message}`);
     }
     
-    // Log de atividade
+    // 7. LOG DE ATIVIDADE
     await ConnectionLog.create({
       action: 'userDisconnectedByLimit',
       status: 'success',
@@ -1103,8 +1136,17 @@ const disconnectAndDisableUser = async (hotspotUser, company, mikrotikClient) =>
       companyId: company.id
     });
     
+    return true;
+    
   } catch (error) {
     console.error(`[DISCONNECT] ❌ Erro ao desconectar '${hotspotUser.username}': ${error.message}`);
+    
+    // Mesmo com erro, atualizar status local como expirado
+    await hotspotUser.update({ 
+      status: 'expired',
+      currentSessionBytes: 0,
+      sessionId: null 
+    });
     
     await ConnectionLog.create({
       action: 'userDisconnectedByLimit',
@@ -1113,6 +1155,198 @@ const disconnectAndDisableUser = async (hotspotUser, company, mikrotikClient) =>
       responseTime: 0,
       companyId: company.id
     });
+    
+    return false;
+  }
+};
+
+const auditAndFixExpiredUsers = async (companyId = null) => {
+  console.log('[AUDIT-FIX] Iniciando verificação de usuários expirados...');
+  
+  try {
+    const whereClause = {};
+    if (companyId) {
+      whereClause.companyId = companyId;
+    }
+    
+    const companies = companyId ? 
+      [await Company.findByPk(companyId)] : 
+      await Company.findAll();
+    
+    let totalFixed = 0;
+    let totalChecked = 0;
+    
+    for (const company of companies) {
+      if (!company) continue;
+      
+      try {
+        console.log(`[AUDIT-FIX] Verificando empresa: ${company.name}`);
+        
+        const mikrotikClient = createMikrotikClient(company);
+        
+        // Buscar usuários que deveriam estar expirados
+        const potentiallyExpiredUsers = await HotspotUser.findAll({
+          where: {
+            companyId: company.id,
+            status: { [Op.in]: ['active', 'expired'] },
+            creditsUsed: { [Op.gte]: require('sequelize').col('creditsTotal') }
+          }
+        });
+        
+        console.log(`[AUDIT-FIX] ${potentiallyExpiredUsers.length} usuários potencialmente expirados em '${company.name}'`);
+        
+        for (const user of potentiallyExpiredUsers) {
+          totalChecked++;
+          
+          const dbCreditsUsed = parseFloat(user.creditsUsed) || 0;
+          const dbCreditsTotal = parseFloat(user.creditsTotal) || 0;
+          
+          // Se o usuário realmente excedeu o limite
+          if (dbCreditsUsed >= dbCreditsTotal && dbCreditsTotal > 0) {
+            
+            if (user.status === 'active') {
+              console.log(`[AUDIT-FIX] 🔧 Usuário '${user.username}' deveria estar expirado mas está ativo`);
+              
+              // Verificar status no MikroTik
+              if (user.mikrotikId) {
+                const mikrotikStatus = await verifyUserStatusInMikroTik(user.mikrotikId, mikrotikClient);
+                
+                if (mikrotikStatus.found && !mikrotikStatus.disabled) {
+                  console.log(`[AUDIT-FIX] 🔧 Desabilitando '${user.username}' no MikroTik...`);
+                  
+                  try {
+                    await mikrotikClient.post('/ip/hotspot/user/set', {
+                      '.id': user.mikrotikId,
+                      disabled: 'true'
+                    }, {
+                      headers: { 'Content-Type': 'application/json' }
+                    });
+                    
+                    console.log(`[AUDIT-FIX] ✅ '${user.username}' desabilitado no MikroTik`);
+                  } catch (disableError) {
+                    console.error(`[AUDIT-FIX] ❌ Erro ao desabilitar '${user.username}': ${disableError.message}`);
+                  }
+                }
+              }
+              
+              // Atualizar status no banco
+              await user.update({ 
+                status: 'expired',
+                sessionId: null,
+                currentSessionBytes: 0,
+                lastExpiredTime: new Date()
+              });
+              
+              totalFixed++;
+              
+              // Enviar email se não foi enviado recentemente
+              try {
+                await sendCreditExhaustedEmail(user, company);
+              } catch (emailError) {
+                console.warn(`[AUDIT-FIX] ⚠️ Erro ao enviar email para '${user.username}': ${emailError.message}`);
+              }
+              
+              await ConnectionLog.create({
+                action: 'auditAndFixExpiredUsers',
+                status: 'success',
+                message: `Usuário '${user.username}' corrigido: estava com crédito excedido (${Math.round(dbCreditsUsed/1024/1024)}MB/${Math.round(dbCreditsTotal/1024/1024)}MB) mas marcado como ativo`,
+                companyId: company.id
+              });
+            }
+          }
+        }
+        
+      } catch (companyError) {
+        console.error(`[AUDIT-FIX] ❌ Erro na empresa '${company.name}': ${companyError.message}`);
+      }
+    }
+    
+    console.log(`[AUDIT-FIX] ✅ Verificação finalizada: ${totalFixed}/${totalChecked} usuários corrigidos`);
+    
+    return { 
+      success: true, 
+      totalChecked, 
+      totalFixed,
+      companies: companies.length
+    };
+    
+  } catch (error) {
+    console.error(`[AUDIT-FIX] ❌ Erro geral na verificação: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+};
+
+const forceExpireUser = async (userId, performingUserId) => {
+  try {
+    const user = await findHotspotUserById(userId);
+    if (!user) {
+      throw new Error('Usuário não encontrado');
+    }
+    
+    const company = await Company.findByPk(user.companyId);
+    if (!company) {
+      throw new Error('Empresa não encontrada');
+    }
+    
+    console.log(`[FORCE-EXPIRE] Forçando expiração do usuário '${user.username}'...`);
+    
+    const mikrotikClient = createMikrotikClient(company);
+    
+    // 1. Desconectar e desabilitar
+    const success = await disconnectAndDisableUser(user, company, mikrotikClient);
+    
+    if (success) {
+      // 2. Registrar atividade
+      await createActivityLog({
+        userId: performingUserId,
+        type: 'hotspot_user_expire',
+        description: `Usuário '${user.username}' foi expirado manualmente.`
+      });
+      
+      console.log(`[FORCE-EXPIRE] ✅ Usuário '${user.username}' expirado com sucesso`);
+      
+      return {
+        success: true,
+        message: `Usuário '${user.username}' foi expirado e desabilitado com sucesso.`
+      };
+    } else {
+      return {
+        success: false,
+        message: `Usuário '${user.username}' foi marcado como expirado no sistema, mas pode não ter sido desabilitado no MikroTik.`
+      };
+    }
+    
+  } catch (error) {
+    console.error(`[FORCE-EXPIRE] ❌ Erro: ${error.message}`);
+    throw error;
+  }
+};
+
+const verifyUserStatusInMikroTik = async (mikrotikId, mikrotikClient) => {
+  try {
+    const response = await mikrotikClient.get('/ip/hotspot/user', {
+      params: {
+        '.proplist': '.id,name,disabled',
+        '?.id': mikrotikId
+      }
+    });
+    
+    const users = response.data || [];
+    const user = users.find(u => u['.id'] === mikrotikId);
+    
+    if (user) {
+      return {
+        found: true,
+        disabled: user.disabled === 'true',
+        name: user.name
+      };
+    }
+    
+    return { found: false, disabled: false };
+    
+  } catch (error) {
+    console.error(`[VERIFY] Erro ao verificar usuário: ${error.message}`);
+    return { found: false, disabled: false, error: error.message };
   }
 };
 
@@ -1208,14 +1442,19 @@ module.exports = {
   updateCredits,
   syncUserStatusWithMikrotik, 
   captureLogoutUsage,              
-  disconnectAndDisableUser,        
+  disconnectAndDisableUser,        // ← CORRIGIDA
   updateCreditsCorrect,            
-  collectActiveSessionUsage,        
+  collectActiveSessionUsage,       // ← CORRIGIDA
   monitorUserLogouts,              
   captureUserLogout,               
   cleanupOrphanedSessions,         
   syncUserCountersWithMikrotik,
-    getSpecificUserData,
+  getSpecificUserData,
   debugMikrotikActiveUsers,
-  testMikrotikConnection
+  testMikrotikConnection,
+  
+  // ✅ NOVAS FUNÇÕES DE AUDITORIA E CORREÇÃO
+  verifyUserStatusInMikroTik,      // ← NOVA
+  auditAndFixExpiredUsers,         // ← NOVA
+  forceExpireUser                  // ← NOVA
 };
