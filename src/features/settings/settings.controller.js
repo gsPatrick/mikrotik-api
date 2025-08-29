@@ -1,6 +1,9 @@
 // src/features/settings/settings.controller.js
+
 const settingsService = require('./settings.service');
 const { sendTestEmail } = require('../../services/email.service');
+// ✅ CORREÇÃO: Importa o scheduler para poder chamá-lo
+const scheduler = require('../../scheduler'); 
 
 const getCurrentSettings = async (req, res) => {
   try {
@@ -13,14 +16,25 @@ const getCurrentSettings = async (req, res) => {
 
 const updateCurrentSettings = async (req, res) => {
   try {
-    const updatedSettings = await settingsService.updateSettings(req.body);
-    res.status(200).json({ success: true, message: 'Configurações atualizadas com sucesso!', data: updatedSettings });
+    const newSettingsData = req.body;
+    const updatedSettings = await settingsService.updateSettings(newSettingsData);
+
+    // ✅ CORREÇÃO PRINCIPAL:
+    // Após salvar as novas configurações no banco de dados,
+    // chamamos a função do scheduler para que ele pare as tarefas antigas
+    // e inicie as novas com os horários que acabaram de ser salvos.
+    await scheduler.rescheduleAllTasks();
+    
+    res.status(200).json({ 
+      success: true, 
+      message: 'Configurações atualizadas e tarefas reagendadas com sucesso!', 
+      data: updatedSettings 
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Erro ao atualizar configurações.', error: error.message });
   }
 };
 
-// <-- Início do Novo Controller -->
 const testEmailSettings = async (req, res) => {
     try {
         const result = await sendTestEmail();
@@ -32,10 +46,9 @@ const testEmailSettings = async (req, res) => {
         res.status(500).json({ success: false, message: 'Erro inesperado no servidor ao tentar enviar e-mail.', error: error.message });
     }
 };
-// <-- Fim do Novo Controller -->
 
 module.exports = {
   getCurrentSettings,
   updateCurrentSettings,
-  testEmailSettings, // <-- Exportar
+  testEmailSettings,
 };

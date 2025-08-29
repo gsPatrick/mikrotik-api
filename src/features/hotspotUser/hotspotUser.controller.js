@@ -40,15 +40,62 @@ const getHotspotUserById = async (req, res) => {
 };
 
 const updateHotspotUser = async (req, res) => {
+  // LOGS DETALHADOS NO CONTROLLER
+  console.log(`[CONTROLLER] === INÍCIO UPDATE HOTSPOT USER ===`);
+  console.log(`[CONTROLLER] Timestamp: ${new Date().toISOString()}`);
+  console.log(`[CONTROLLER] Method: ${req.method}`);
+  console.log(`[CONTROLLER] URL: ${req.originalUrl}`);
+  console.log(`[CONTROLLER] Params:`, req.params);
+  console.log(`[CONTROLLER] Body recebido:`, JSON.stringify(req.body, null, 2));
+  console.log(`[CONTROLLER] Headers Content-Type:`, req.headers['content-type']);
+  console.log(`[CONTROLLER] Usuario autenticado:`, req.user ? { id: req.user.id, name: req.user.name } : 'Não encontrado');
+
   const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ success: false, errors: errors.array() });
+  if (!errors.isEmpty()) {
+    console.log(`[CONTROLLER] ❌ Erros de validação:`, errors.array());
+    return res.status(400).json({ success: false, errors: errors.array() });
+  }
+
+  console.log(`[CONTROLLER] ✅ Validação passou, chamando service...`);
 
   try {
     const hotspotUser = await hotspotUserService.updateHotspotUser(req.params.id, req.body);
-    if (!hotspotUser) return res.status(404).json({ success: false, message: 'Usuário do hotspot não encontrado.' });
-    res.status(200).json({ success: true, message: 'Usuário do hotspot atualizado com sucesso!', data: hotspotUser });
+    
+    if (!hotspotUser) {
+      console.log(`[CONTROLLER] ❌ Usuário não encontrado com ID: ${req.params.id}`);
+      return res.status(404).json({ success: false, message: 'Usuário do hotspot não encontrado.' });
+    }
+
+    console.log(`[CONTROLLER] ✅ Service retornou sucesso`);
+    console.log(`[CONTROLLER] Dados retornados do service:`, {
+      id: hotspotUser.id,
+      username: hotspotUser.username,
+      status: hotspotUser.status,
+      turma: hotspotUser.turma,
+      updatedAt: hotspotUser.updatedAt
+    });
+    
+    const response = {
+      success: true, 
+      message: 'Usuário do hotspot atualizado com sucesso!', 
+      data: hotspotUser
+    };
+    
+    console.log(`[CONTROLLER] === FIM UPDATE HOTSPOT USER (SUCESSO) ===`);
+    res.status(200).json(response);
+
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Erro ao atualizar usuário do hotspot.', error: error.message });
+    console.log(`[CONTROLLER] === ERRO NO UPDATE ===`);
+    console.log(`[CONTROLLER] Error object:`, error);
+    console.log(`[CONTROLLER] Error message:`, error.message);
+    console.log(`[CONTROLLER] Error stack:`, error.stack);
+    console.log(`[CONTROLLER] === FIM UPDATE HOTSPOT USER (ERRO) ===`);
+    
+    res.status(500).json({ 
+      success: false, 
+      message: 'Erro ao atualizar usuário do hotspot.', 
+      error: error.message 
+    });
   }
 };
 

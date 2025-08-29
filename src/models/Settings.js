@@ -5,13 +5,16 @@ const sequelize = require('../config/database');
 const Settings = sequelize.define('Settings', {
   id: {
     type: DataTypes.INTEGER,
-    // autoIncrement: true, // SERIAL já faz isso, mas vamos manter para o Sequelize
     primaryKey: true,
-    // REMOVEMOS o `defaultValue: 1` daqui para evitar o conflito
   },
   systemName: {
     type: DataTypes.STRING,
     defaultValue: 'Hotspot Manager',
+  },
+  creditMode: {
+    type: DataTypes.ENUM('reset', 'accumulate'),
+    defaultValue: 'reset',
+    comment: 'Define se o crédito diário reseta para o valor padrão ou se acumula ao saldo existente.',
   },
   systemLogoUrl: {
     type: DataTypes.STRING,
@@ -46,10 +49,27 @@ const Settings = sequelize.define('Settings', {
     allowNull: true,
     comment: 'E-mail do administrador que receberá as notificações.'
   },
+  
+  // --- INÍCIO DAS NOVAS CONFIGURAÇÕES DE CRON JOBS ---
+  usageCollectionCron: {
+    type: DataTypes.STRING,
+    defaultValue: '*/1 * * * *', // Padrão: A cada 1 minuto
+    comment: 'Expressão Cron para a coleta de uso de dados do MikroTik.'
+  },
+  companyStatusMonitorCron: {
+    type: DataTypes.STRING,
+    defaultValue: '*/5 * * * *', // Padrão: A cada 5 minutos
+    comment: 'Expressão Cron para o monitoramento de status das empresas.'
+  },
+  mikrotikDataSyncCron: {
+    type: DataTypes.STRING,
+    defaultValue: '0 4 * * *', // Padrão: Todo dia às 04:00 UTC
+    comment: 'Expressão Cron para a sincronização de perfis e usuários do MikroTik.'
+  },
+  // --- FIM DAS NOVAS CONFIGURAÇÕES DE CRON JOBS ---
 });
 
-// Adicionamos um "hook" que garante que a primeira linha seja criada com ID 1
-// após a sincronização, se a tabela estiver vazia.
+// Hook que garante que a primeira linha seja criada com ID 1
 Settings.afterSync(async (options) => {
   const count = await Settings.count();
   if (count === 0) {
